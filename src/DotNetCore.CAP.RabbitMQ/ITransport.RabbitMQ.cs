@@ -8,7 +8,7 @@ using DotNetCore.CAP.Internal;
 using DotNetCore.CAP.Messages;
 using DotNetCore.CAP.Transport;
 using Microsoft.Extensions.Logging;
-using RabbitMQ.Client;
+using Rabbit = RabbitMQ.Client;
 
 namespace DotNetCore.CAP.RabbitMQ;
 
@@ -29,18 +29,16 @@ internal sealed class RabbitMqTransport : ITransport
 
     public async Task<OperateResult> SendAsync(TransportMessage message)
     {
-        IChannel? channel = null;
+        Rabbit.IModel? channel = null;
         try
         {
             channel = await _connectionChannelPool.Rent();
 
-            var props = new BasicProperties
-            {
-                DeliveryMode = DeliveryModes.Persistent,
-                Headers = message.Headers.ToDictionary(x => x.Key, object? (x) => x.Value)
-            };
+            var props = channel.CreateBasicProperties();
+            props.DeliveryMode = 2;
+            props.Headers = message.Headers.ToDictionary(x => x.Key, x => (object?)x.Value);
 
-            await channel.BasicPublishAsync(_exchange, message.GetName(), false, props, message.Body);
+            channel.BasicPublish(_exchange, message.GetName(), false, props, message.Body.ToArray());
 
             _logger.LogInformation("CAP message '{0}' published, internal id '{1}'", message.GetName(), message.GetId());
 
