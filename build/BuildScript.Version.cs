@@ -49,7 +49,7 @@ namespace BuildScript
                 Minor = int.Parse(versionMinor),
                 Patch = int.Parse(versionPatch),
                 Quality = versionQuality,
-                Suffix = suffix
+                Suffix = "rabbit-downgrade"
             };
 
             return version;
