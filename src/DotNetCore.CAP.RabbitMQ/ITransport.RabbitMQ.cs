@@ -28,25 +28,24 @@ internal sealed class RabbitMqTransport : ITransport
 
     public BrokerAddress BrokerAddress => new("RabbitMQ", _connectionChannelPool.HostAddress);
 
-    public async Task<OperateResult> SendAsync(TransportMessage message)
+    public Task<OperateResult> SendAsync(TransportMessage message)
     {
-        IChannel? channel = null;
+        IModel? channel = null;
         try
         {
-            channel = await _connectionChannelPool.Rent();
+            channel = _connectionChannelPool.Rent();
 
-            var props = new BasicProperties
-            {
-                MessageId = message.GetId(),
-                DeliveryMode = DeliveryModes.Persistent,
-                Headers = message.Headers.ToDictionary(x => x.Key, object? (x) => x.Value)
-            };
+            var props = channel.CreateBasicProperties();
+            props.DeliveryMode = 2;
+            props.Headers = message.Headers.ToDictionary(x => x.Key, x => (object?)x.Value);
 
-            await channel.BasicPublishAsync(_exchange, message.GetName(), false, props, message.Body);
+            channel.BasicPublish(_exchange, message.GetName(), false, props, message.Body.ToArray());
+            
+            if (channel.NextPublishSeqNo > 0) channel.WaitForConfirmsOrDie(TimeSpan.FromSeconds(5));
 
             _logger.LogInformation("CAP message '{0}' published, internal id '{1}'", message.GetName(), message.GetId());
 
-            return OperateResult.Success;
+            return Task.FromResult(OperateResult.Success);
         }
         catch (Exception ex)
         {
@@ -57,7 +56,7 @@ internal sealed class RabbitMqTransport : ITransport
 
                 _logger.LogWarning("Channel state inconsistency detected: channel is reported as open, but its underlying connection is closed. Forcing channel closure.");
 
-                await channel.DisposeAsync();
+                channel.Dispose();
             }
 
             var wrapperEx = new PublisherSentFailedException(ex.Message, ex);
@@ -67,7 +66,7 @@ internal sealed class RabbitMqTransport : ITransport
                 Description = ex.Message
             };
 
-            return OperateResult.Failed(wrapperEx, errors);
+            return Task.FromResult(OperateResult.Failed(wrapperEx, errors));
         }
         finally
         {

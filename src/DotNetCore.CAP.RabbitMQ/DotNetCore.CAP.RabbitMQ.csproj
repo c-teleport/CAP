@@ -8,11 +8,8 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="RabbitMQ.Client" Version="7.2.0" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <ProjectReference Include="..\DotNetCore.CAP\DotNetCore.CAP.csproj" />
+    <PackageReference Include="cteleport.dotnetcore.cap" Version="10.0.0" />
+    <PackageReference Include="RabbitMQ.Client" Version="5.0.1" />
   </ItemGroup>
 
 </Project>

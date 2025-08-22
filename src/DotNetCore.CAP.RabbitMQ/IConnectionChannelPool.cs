@@ -14,7 +14,7 @@ public interface IConnectionChannelPool
 
     IConnection GetConnection();
 
-    Task<IChannel> Rent();
+    IModel Rent();
 
-    bool Return(IChannel context);
+    bool Return(IModel context);
 }

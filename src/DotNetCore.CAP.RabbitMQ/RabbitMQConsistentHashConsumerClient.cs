@@ -22,7 +22,7 @@ internal sealed class RabbitMqConsistentProcessingClient : IConsumerClient
     private readonly string _queueName;
     private readonly RabbitMQOptions _rabbitMqOptions;
     private RabbitMqBasicConsumer? _consumer = null;
-    private IChannel? _channel;
+    private IModel? _channel;
     private readonly string _queueBindingExchangeName;
 
     public RabbitMqConsistentProcessingClient(string queueName, 
@@ -53,11 +53,11 @@ internal sealed class RabbitMqConsistentProcessingClient : IConsumerClient
 
         foreach (var topic in topics)
         {
-            await _channel!.ExchangeBindAsync(_queueBindingExchangeName, _exchangeName, topic);
+            _channel!.ExchangeBind(_queueBindingExchangeName, _exchangeName, topic);
         }
         
         const string weightOfTheShard = "1"; // In this case, all messages go to all consumers sharded equally.
-        await _channel!.QueueBindAsync(_queueName, _queueBindingExchangeName, weightOfTheShard);
+        _channel!.QueueBind(_queueName, _queueBindingExchangeName, weightOfTheShard);
     }
 
     public async Task ListeningAsync(TimeSpan timeout, CancellationToken cancellationToken)
@@ -66,11 +66,11 @@ internal sealed class RabbitMqConsistentProcessingClient : IConsumerClient
 
         if (_rabbitMqOptions.BasicQosOptions != null)
         {
-            await _channel!.BasicQosAsync(0, _rabbitMqOptions.BasicQosOptions.PrefetchCount, _rabbitMqOptions.BasicQosOptions.Global, cancellationToken);
+            _channel!.BasicQos(0, _rabbitMqOptions.BasicQosOptions.PrefetchCount, _rabbitMqOptions.BasicQosOptions.Global);
         }
         else
         {
-            await _channel!.BasicQosAsync(prefetchSize: 0, prefetchCount: 1, global: false, cancellationToken);
+            _channel!.BasicQos(prefetchSize: 0, prefetchCount: 1, global: false);
         }
 
         _consumer = new RabbitMqBasicConsumer(_channel!, concurrent: 0, _queueName, OnMessageCallback!, OnLogCallback!,
@@ -78,11 +78,11 @@ internal sealed class RabbitMqConsistentProcessingClient : IConsumerClient
 
         try
         {
-            await _channel!.BasicConsumeAsync(_queueName, false, _consumer, cancellationToken);
+            _channel!.BasicConsume(_queueName, false, _consumer);
         }
         catch (TimeoutException ex)
         {
-            await _consumer.HandleChannelShutdownAsync(null!, new ShutdownEventArgs(ShutdownInitiator.Application, 0, ex.Message + "-->" + nameof(_channel.BasicConsumeAsync)));
+            await _consumer.HandleModelShutdown(null!, new ShutdownEventArgs(ShutdownInitiator.Application, 0, ex.Message + "-->" + nameof(_channel.BasicConsume)));
         }
 
         while (true)
@@ -90,25 +90,28 @@ internal sealed class RabbitMqConsistentProcessingClient : IConsumerClient
             cancellationToken.ThrowIfCancellationRequested();
             cancellationToken.WaitHandle.WaitOne(timeout);
         }
+
         // ReSharper disable once FunctionNeverReturns
     }
 
-    public async Task CommitAsync(object? sender)
+    public Task CommitAsync(object? sender)
     {
-        await _consumer!.BasicAck((ulong)sender!);
+        _consumer!.BasicAck((ulong)sender!);
+        return Task.CompletedTask;
     }
 
-    public async Task RejectAsync(object? sender)
+    public Task RejectAsync(object? sender)
     {
-        await _consumer!.BasicReject((ulong)sender!);
+        _consumer!.BasicReject((ulong)sender!);
+        return Task.CompletedTask;
     }
 
     public ValueTask DisposeAsync()
     {
         _channel?.Dispose();
-        return ValueTask.CompletedTask;
         //The connection should not be closed here, because the connection is still in use elsewhere. 
         //_connection?.Dispose();
+        return ValueTask.CompletedTask;
     }
 
     public async Task ConnectAsync()
@@ -119,10 +122,10 @@ internal sealed class RabbitMqConsistentProcessingClient : IConsumerClient
 
         if (_channel == null || _channel.IsClosed)
         {
-            _channel = await connection.CreateChannelAsync();
+            _channel = connection.CreateModel();
             
-            await _channel.ExchangeDeclareAsync(_exchangeName, RabbitMQOptions.ExchangeType, true);
-            await _channel.ExchangeDeclareAsync(_queueBindingExchangeName,
+            _channel.ExchangeDeclare(_exchangeName, RabbitMQOptions.ExchangeType, true);
+            _channel.ExchangeDeclare(_queueBindingExchangeName,
                 RabbitMQOptions.ConsistentHashExchangeType,
                 true, arguments: new Dictionary<string, object?>
                 {
@@ -142,14 +145,14 @@ internal sealed class RabbitMqConsistentProcessingClient : IConsumerClient
 
             try
             {
-                await _channel.QueueDeclareAsync(_queueName, _rabbitMqOptions.QueueOptions.Durable, _rabbitMqOptions.QueueOptions.Exclusive, _rabbitMqOptions.QueueOptions.AutoDelete, arguments);
+                _channel.QueueDeclare(_queueName, _rabbitMqOptions.QueueOptions.Durable, _rabbitMqOptions.QueueOptions.Exclusive, _rabbitMqOptions.QueueOptions.AutoDelete, arguments);
             }
             catch (TimeoutException ex)
             {
                 var args = new LogMessageEventArgs
                 {
                     LogType = MqLogType.ConsumerShutdown,
-                    Reason = ex.Message + "-->" + nameof(_channel.QueueDeclareAsync)
+                    Reason = ex.Message + "-->" + nameof(_channel.QueueDeclare)
                 };
 
                 OnLogCallback!(args);
