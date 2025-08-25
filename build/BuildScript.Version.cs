@@ -49,7 +49,7 @@ namespace BuildScript
                 Minor = int.Parse(versionMinor),
                 Patch = int.Parse(versionPatch),
                 Quality = versionQuality,
-                Suffix = "concurrency-fix"
+                Suffix = "ct"
             };
 
             return version;
