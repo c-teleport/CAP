@@ -5,6 +5,7 @@
 		<Nullable>enable</Nullable>
 		<PackageTags>$(PackageTags);Pulsar</PackageTags>
 		<NoWarn>CS0067</NoWarn>
+		<PackageId>CTeleport.$(AssemblyName)</PackageId>
 	</PropertyGroup>
 
 	<ItemGroup>
