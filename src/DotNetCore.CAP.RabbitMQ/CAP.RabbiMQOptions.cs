@@ -37,6 +37,12 @@ public class RabbitMQOptions
 
     /// <summary> The topic exchange type. </summary>
     public const string ExchangeType = "topic";
+    
+    /// <summary> The consistent hash exchange type. </summary>
+    public const string ConsistentHashExchangeType = "x-consistent-hash";
+    
+    /// <summary> The hash header name. </summary>
+    public const string ConsistentHashHeader = "hash-key";
 
     /// <summary>
     /// The host to connect to.

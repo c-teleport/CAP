@@ -13,7 +13,9 @@ internal sealed class RabbitMqConsumerClientFactory : IConsumerClientFactory
     private readonly IOptions<RabbitMQOptions> _rabbitMqOptions;
     private readonly IServiceProvider _serviceProvider;
 
-    public RabbitMqConsumerClientFactory(IOptions<RabbitMQOptions> rabbitMqOptions, IConnectionChannelPool channelPool,
+    public RabbitMqConsumerClientFactory(
+        IOptions<RabbitMQOptions> rabbitMqOptions, 
+        IConnectionChannelPool channelPool,
         IServiceProvider serviceProvider)
     {
         _rabbitMqOptions = rabbitMqOptions;
@@ -23,11 +25,35 @@ internal sealed class RabbitMqConsumerClientFactory : IConsumerClientFactory
 
     public IConsumerClient Create(string groupId, byte concurrent)
     {
+        var messagingTopology = MessagingTopologyHelper.GetTopology(groupId);
+        return messagingTopology.QueueBindingExchangeType switch
+        {
+            RabbitMQOptions.ConsistentHashExchangeType => CreateConsistentHashClient(messagingTopology),
+            _ => CreateConsumerClient(messagingTopology, concurrent)
+        };
+    }
+
+    private RabbitMqConsistentProcessingClient CreateConsistentHashClient(MessagingTopology topology)
+    {
         try
         {
-            var client = new RabbitMqConsumerClient(groupId, concurrent, _connectionChannelPool,
+            var client = new RabbitMqConsistentProcessingClient(topology.QueueName, topology.QueueBindingExchangeName,
+                _connectionChannelPool, _rabbitMqOptions, _serviceProvider);
+            client.Connect().GetAwaiter().GetResult();
+            return client;
+        }
+        catch (Exception e)
+        {
+            throw new BrokerConnectionException(e);
+        }
+    }
+    
+    private RabbitMqConsumerClient CreateConsumerClient(MessagingTopology topology, byte concurrent)
+    {
+        try
+        {
+            var client = new RabbitMqConsumerClient(topology.QueueName, concurrent, _connectionChannelPool,
                 _rabbitMqOptions, _serviceProvider);
-            
             client.Connect().GetAwaiter().GetResult();
             
             return client;
