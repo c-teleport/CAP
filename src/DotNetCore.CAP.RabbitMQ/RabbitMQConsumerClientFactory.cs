@@ -22,11 +22,38 @@ internal sealed class RabbitMqConsumerClientFactory : IConsumerClientFactory
         _serviceProvider = serviceProvider;
     }
 
-    public async Task<IConsumerClient> CreateAsync(string groupId, byte concurrent)
+    public Task<IConsumerClient> CreateAsync(string groupId, byte concurrent)
+    {
+        var messagingTopology = MessagingTopologyHelper.GetTopology(groupId);
+        return messagingTopology.QueueBindingExchangeType switch
+        {
+            RabbitMQOptions.ConsistentHashExchangeType => CreateConsistentProcessingClientAsync(messagingTopology),
+            _ => CreateConsumerClientAsync(messagingTopology, concurrent)
+        };
+    }
+
+    private async Task<IConsumerClient> CreateConsistentProcessingClientAsync(MessagingTopology topology)
     {
         try
         {
-            var client = new RabbitMqConsumerClient(groupId, concurrent, _connectionChannelPool,
+            var client = new RabbitMqConsistentProcessingClient(topology.QueueName, topology.QueueBindingExchangeName,
+                _connectionChannelPool, _rabbitMqOptions, _serviceProvider);
+            
+            await client.ConnectAsync();
+            
+            return client;
+        }
+        catch (Exception e)
+        {
+            throw new BrokerConnectionException(e);
+        }
+    }
+    
+    private async Task<IConsumerClient> CreateConsumerClientAsync(MessagingTopology topology, byte concurrent)
+    {
+        try
+        {
+            var client = new RabbitMqConsumerClient(topology.QueueName, concurrent, _connectionChannelPool,
                 _rabbitMqOptions, _serviceProvider);
             
             await client.ConnectAsync();

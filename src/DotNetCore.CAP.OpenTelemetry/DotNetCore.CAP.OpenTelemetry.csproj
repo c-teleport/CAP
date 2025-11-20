@@ -5,6 +5,7 @@
 	<Nullable>enable</Nullable>
 	<Description>CAP instrumentation for OpenTelemetry .NET</Description>
     <PackageTags>$(PackageTags);distributed-tracing;opentelemetry;</PackageTags>
+    <PackageId>CTeleport.$(AssemblyName)</PackageId>
   </PropertyGroup>
 
   <ItemGroup>
