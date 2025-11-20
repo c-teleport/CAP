@@ -15,7 +15,7 @@ public static class MessagingTopologyHelper
             {
                 QueueName = groupId,
                 QueueBindingExchangeType = RabbitMQOptions.ConsistentHashExchangeType,
-                QueueBindingExchangeName = groupId[..replicaIndex]
+                QueueBindingExchangeName = groupId[..replicaIndex].Replace(".queue.", ".exchange.")
             };
         }
         
