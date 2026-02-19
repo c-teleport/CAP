@@ -84,7 +84,7 @@ public class MethodMatcherCache
             return matchTopic != null;
         }
 
-        // O(1) fallback for sharded consumer groups: when a shard consumer writes a message to DB
+        // fallback for sharded consumer groups: when a shard consumer writes a message to DB
         // it uses the logical group name as the group header, so retried messages arrive here
         // with the logical group name rather than the shard-specific group name.
         if (BaseGroupEntries.TryGetValue(groupName, out var baseGroupMatchTopics))

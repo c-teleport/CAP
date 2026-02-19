@@ -19,9 +19,9 @@ internal sealed class RabbitMqConsistentProcessingClient : IConsumerClient
     private readonly IConnectionChannelPool _connectionChannelPool;
     private readonly IServiceProvider _serviceProvider;
     private readonly string _exchangeName;
-    private readonly string _groupName;
     private readonly string _queueName;
     private readonly string _queueBindingExchangeName;
+    private readonly string _groupName;
     private readonly RabbitMQOptions _rabbitMqOptions;
     private RabbitMqBasicConsumer? _consumer;
     private IChannel? _channel;
@@ -31,12 +31,12 @@ internal sealed class RabbitMqConsistentProcessingClient : IConsumerClient
         IOptions<RabbitMQOptions> options,
         IServiceProvider serviceProvider)
     {
-        _queueName = topology.QueueName;
-        _groupName = topology.GroupName;
         _connectionChannelPool = connectionChannelPool;
         _serviceProvider = serviceProvider;
         _rabbitMqOptions = options.Value;
         _exchangeName = connectionChannelPool.Exchange;
+        _queueName = topology.QueueName;
+        _groupName = topology.GroupName;
         _queueBindingExchangeName = topology.QueueBindingExchangeName;
     }
 
