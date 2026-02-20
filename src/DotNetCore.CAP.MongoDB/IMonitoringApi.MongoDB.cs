@@ -4,6 +4,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using DotNetCore.CAP.Internal;
 using DotNetCore.CAP.Messages;
@@ -11,6 +12,7 @@ using DotNetCore.CAP.Monitoring;
 using DotNetCore.CAP.Persistence;
 using DotNetCore.CAP.Serialization;
 using Microsoft.Extensions.Options;
+using MongoDB.Bson;
 using MongoDB.Driver;
 
 namespace DotNetCore.CAP.MongoDB;
@@ -127,15 +129,14 @@ public class MongoDBMonitoringApi : IMonitoringApi
         var collection = _database.GetCollection<ReceivedMessage>(_options.ReceivedCollection);
         var builder = Builders<ReceivedMessage>.Filter;
         var filter = builder.Empty;
-        if (!string.IsNullOrEmpty(queryDto.StatusName))
-            filter &= builder.Regex(x => x.StatusName, $"/{queryDto.StatusName}/i");
+        if (!string.IsNullOrEmpty(queryDto.StatusName)) filter &= builder.Eq(x => x.StatusName, queryDto.StatusName);
 
         if (!string.IsNullOrEmpty(queryDto.Name)) filter &= builder.Eq(x => x.Name, queryDto.Name);
 
         if (!string.IsNullOrEmpty(queryDto.Group)) filter &= builder.Eq(x => x.Group, queryDto.Group);
 
         if (!string.IsNullOrEmpty(queryDto.Content))
-            filter &= builder.Regex(x => x.Content, $".*{queryDto.Content}.*");
+            filter &= builder.Regex(x => x.Content, new BsonRegularExpression(Regex.Escape(queryDto.Content), "i"));
 
         var queryItems = await collection.Find(filter)
             .SortByDescending(x => x.Added)
