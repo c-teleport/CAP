@@ -283,7 +283,7 @@ public class RouteActionProvider
         var pageIndex = httpContext.Request.Query["currentPage"].ToInt32OrDefault(1);
         var name = httpContext.Request.Query["name"].ToString();
         var content = httpContext.Request.Query["content"].ToString();
-        var status = routeValue["status"]?.ToString() ?? nameof(StatusName.Succeeded);
+        var status = NormalizeStatus(routeValue["status"]?.ToString());
 
         var queryDto = new MessageQueryDto
         {
@@ -310,7 +310,7 @@ public class RouteActionProvider
         var name = httpContext.Request.Query["name"].ToString();
         var group = httpContext.Request.Query["group"].ToString();
         var content = httpContext.Request.Query["content"].ToString();
-        var status = routeValue["status"]?.ToString() ?? nameof(StatusName.Succeeded);
+        var status = NormalizeStatus(routeValue["status"]?.ToString());
 
         var queryDto = new MessageQueryDto
         {
@@ -444,6 +444,19 @@ public class RouteActionProvider
             httpContext.Response.StatusCode = (int)HttpStatusCode.BadGateway;
             await httpContext.Response.WriteAsync(e.Message);
         }
+    }
+    
+    private static string NormalizeStatus(string status)
+    {
+        return status?.ToLowerInvariant() switch
+        {
+            "failed"    => nameof(StatusName.Failed),
+            "succeeded" => nameof(StatusName.Succeeded),
+            "scheduled" => nameof(StatusName.Scheduled),
+            "queued"    => nameof(StatusName.Queued),
+            "delayed"   => nameof(StatusName.Delayed),
+            _ => nameof(StatusName.Succeeded)
+        };
     }
 
     private void BadRequest(HttpContext httpContext)

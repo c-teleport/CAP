@@ -265,9 +265,9 @@ public class MongoDBDataStorage : IDataStorage
         var queryResult = await collection
             .Find(x => x.Retries < _capOptions.Value.FailedRetryCount
                        && x.Added < fourMinAgo
-                       && x.Version == _capOptions.Value.Version
                        && (x.StatusName == nameof(StatusName.Failed) ||
                            x.StatusName == nameof(StatusName.Scheduled)))
+            .SortBy(x => x.Added)
             .Limit(200)
             .ToListAsync().ConfigureAwait(false);
         return queryResult.Select(x => new MediumMessage
@@ -286,9 +286,9 @@ public class MongoDBDataStorage : IDataStorage
         var queryResult = await collection
             .Find(x => x.Retries < _capOptions.Value.FailedRetryCount
                        && x.Added < fourMinAgo
-                       && x.Version == _capOptions.Value.Version
                        && (x.StatusName == nameof(StatusName.Failed) ||
                            x.StatusName == nameof(StatusName.Scheduled)))
+            .SortBy(x => x.Added)
             .Limit(200)
             .ToListAsync().ConfigureAwait(false);
         return queryResult.Select(x => new MediumMessage
@@ -321,12 +321,11 @@ public class MongoDBDataStorage : IDataStorage
 
         var update = Builders<PublishedMessage>.Update.Set(x => x._lockToken, ObjectId.GenerateNewId());
 
-        var filter = Builders<PublishedMessage>.Filter.Where(x => x.Version == _capOptions.Value.Version
-                                                                  && ((x.StatusName == nameof(StatusName.Delayed) &&
-                                                                       x.ExpiresAt < DateTime.Now.AddMinutes(2))
-                                                                      ||
-                                                                      (x.StatusName == nameof(StatusName.Queued) &&
-                                                                       x.ExpiresAt < DateTime.Now.AddMinutes(-1)))
+        var filter = Builders<PublishedMessage>.Filter.Where(x => (x.StatusName == nameof(StatusName.Delayed) &&
+                                                                   x.ExpiresAt < DateTime.Now.AddMinutes(2))
+                                                                  ||
+                                                                  (x.StatusName == nameof(StatusName.Queued) &&
+                                                                   x.ExpiresAt < DateTime.Now.AddMinutes(-1))
         );
 
         using var timeoutTs = new CancellationTokenSource(TimeSpan.FromSeconds(10));
@@ -347,6 +346,7 @@ public class MongoDBDataStorage : IDataStorage
                         .ConfigureAwait(false);
 
                     var queryResult = await collection.Find(session, filter)
+                        .SortBy(x => x.Added)
                         .Limit(_capOptions.Value.SchedulerBatchSize)
                         .ToListAsync(linkedTs.Token)
                         .ConfigureAwait(false);
