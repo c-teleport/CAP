@@ -1,8 +1,14 @@
 namespace DotNetCore.CAP.RabbitMQ;
 
-public sealed record MessagingTopology
+public abstract record MessagingTopology
+{
+    public required string GroupName { get; init; }
+}
+
+public sealed record TopicMessagingTopology : MessagingTopology { }
+
+public sealed record ConsistentHashMessagingTopology : MessagingTopology
 {
     public required string QueueName { get; init; }
-    public required string QueueBindingExchangeType { get; init; }
-    public string? QueueBindingExchangeName { get; init; }
+    public required string QueueBindingExchangeName { get; init; }
 }

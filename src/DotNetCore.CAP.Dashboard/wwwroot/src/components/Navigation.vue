@@ -79,7 +79,9 @@ export default {
       brandTitle: "CAP Dashboard",
       languages: [
         { name: "English", code: "en-us", active: true },
-        { name: "简体中文", code: "zh-cn", active: false }
+        { name: "简体中文", code: "zh-cn", active: false },
+        { name: "Русский", code: "ru-ru", active: false },
+        { name: "Nederlands", code: "nl-nl", active: false }
       ],
       menus: [
         { name: "Published", path: "/published", variant: "danger", badge: "publishedFailed" },

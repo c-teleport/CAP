@@ -20,23 +20,24 @@ internal sealed class RabbitMqConsistentProcessingClient : IConsumerClient
     private readonly IServiceProvider _serviceProvider;
     private readonly string _exchangeName;
     private readonly string _queueName;
-    private readonly RabbitMQOptions _rabbitMqOptions;
-    private RabbitMqBasicConsumer? _consumer = null;
-    private IModel? _channel;
     private readonly string _queueBindingExchangeName;
+    private readonly string _groupName;
+    private readonly RabbitMQOptions _rabbitMqOptions;
+    private RabbitMqBasicConsumer? _consumer;
+    private IModel? _channel;
 
-    public RabbitMqConsistentProcessingClient(string queueName, 
-        string queueBindingExchange,
+    public RabbitMqConsistentProcessingClient(ConsistentHashMessagingTopology topology,
         IConnectionChannelPool connectionChannelPool,
         IOptions<RabbitMQOptions> options,
         IServiceProvider serviceProvider)
     {
-        _queueName = queueName;
         _connectionChannelPool = connectionChannelPool;
         _serviceProvider = serviceProvider;
         _rabbitMqOptions = options.Value;
         _exchangeName = connectionChannelPool.Exchange;
-        _queueBindingExchangeName = queueBindingExchange;
+        _queueName = topology.QueueName;
+        _groupName = topology.GroupName;
+        _queueBindingExchangeName = topology.QueueBindingExchangeName;
     }
 
     public Func<TransportMessage, object?, Task>? OnMessageCallback { get; set; }
@@ -73,7 +74,7 @@ internal sealed class RabbitMqConsistentProcessingClient : IConsumerClient
             _channel!.BasicQos(prefetchSize: 0, prefetchCount: 1, global: false);
         }
 
-        _consumer = new RabbitMqBasicConsumer(_channel!, concurrent: 0, _queueName, OnMessageCallback!, OnLogCallback!,
+        _consumer = new RabbitMqBasicConsumer(_channel!, concurrent: 0, _groupName, OnMessageCallback!, OnLogCallback!,
             _rabbitMqOptions.CustomHeadersBuilder, _serviceProvider);
 
         try

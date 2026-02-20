@@ -22,7 +22,7 @@ namespace BuildScript
             versionQuality = string.IsNullOrWhiteSpace(versionQuality) ? null : versionQuality;
 
             var suffix = versionQuality;
-
+/*
             var isCi = false;
             var isTagged = false;
             if (!context.BuildServers().IsLocalBuild)
@@ -39,7 +39,7 @@ namespace BuildScript
             if (!isTagged)
             {
                 suffix += (isCi ? "preview-" : "dv-") + CreateStamp();
-            }
+            }*/
 
             suffix = string.IsNullOrWhiteSpace(suffix) ? null : suffix;
 

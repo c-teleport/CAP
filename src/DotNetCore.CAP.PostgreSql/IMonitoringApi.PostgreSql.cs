@@ -87,7 +87,7 @@ SELECT
         var tableName = queryDto.MessageType == MessageType.Publish ? _pubName : _recName;
         var where = string.Empty;
 
-        if (!string.IsNullOrEmpty(queryDto.StatusName)) where += " AND Lower(\"StatusName\") = Lower(@StatusName)";
+        if (!string.IsNullOrEmpty(queryDto.StatusName)) where += " AND \"StatusName\" = @StatusName";
 
         if (!string.IsNullOrEmpty(queryDto.Name)) where += " AND Lower(\"Name\") = Lower(@Name)";
 
