@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Core Community. All rights reserved.
+// Copyright (c) .NET Core Community. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
@@ -22,25 +22,25 @@ internal sealed class RabbitMqConsumerClientFactory : IConsumerClientFactory
         _serviceProvider = serviceProvider;
     }
 
-    public Task<IConsumerClient> CreateAsync(string groupId, byte concurrent)
+    public Task<IConsumerClient> CreateAsync(string groupName, byte groupConcurrent)
     {
-        var messagingTopology = MessagingTopologyHelper.GetTopology(groupId);
-        return messagingTopology.QueueBindingExchangeType switch
+        var topology = MessagingTopologyHelper.GetTopology(groupName);
+        return topology switch
         {
-            RabbitMQOptions.ConsistentHashExchangeType => CreateConsistentProcessingClientAsync(messagingTopology),
-            _ => CreateConsumerClientAsync(messagingTopology, concurrent)
+            ConsistentHashMessagingTopology ch => CreateConsistentProcessingClientAsync(ch),
+            TopicMessagingTopology topic => CreateConsumerClientAsync(topic, groupConcurrent),
+            _ => throw new ArgumentOutOfRangeException(nameof(groupName), $"Unhandled topology type for group '{groupName}'.")
         };
     }
 
-    private async Task<IConsumerClient> CreateConsistentProcessingClientAsync(MessagingTopology topology)
+    private async Task<IConsumerClient> CreateConsistentProcessingClientAsync(ConsistentHashMessagingTopology topology)
     {
         try
         {
-            var client = new RabbitMqConsistentProcessingClient(topology.QueueName, topology.QueueBindingExchangeName,
-                _connectionChannelPool, _rabbitMqOptions, _serviceProvider);
-            
+            var client = new RabbitMqConsistentProcessingClient(topology, _connectionChannelPool, _rabbitMqOptions, _serviceProvider);
+
             await client.ConnectAsync();
-            
+
             return client;
         }
         catch (Exception e)
@@ -48,16 +48,16 @@ internal sealed class RabbitMqConsumerClientFactory : IConsumerClientFactory
             throw new BrokerConnectionException(e);
         }
     }
-    
-    private async Task<IConsumerClient> CreateConsumerClientAsync(MessagingTopology topology, byte concurrent)
+
+    private async Task<IConsumerClient> CreateConsumerClientAsync(TopicMessagingTopology topology, byte concurrent)
     {
         try
         {
-            var client = new RabbitMqConsumerClient(topology.QueueName, concurrent, _connectionChannelPool,
+            var client = new RabbitMqConsumerClient(topology.GroupName, concurrent, _connectionChannelPool,
                 _rabbitMqOptions, _serviceProvider);
-            
+
             await client.ConnectAsync();
-            
+
             return client;
         }
         catch (Exception e)

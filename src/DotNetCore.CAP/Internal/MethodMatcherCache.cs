@@ -1,7 +1,6 @@
 ﻿// Copyright (c) .NET Core Community. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
-using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
@@ -17,10 +16,15 @@ public class MethodMatcherCache
     {
         _selector = selector;
         Entries = new ConcurrentDictionary<string, IReadOnlyList<ConsumerExecutorDescriptor>>();
+        BaseGroupEntries = new ConcurrentDictionary<string, IReadOnlyList<ConsumerExecutorDescriptor>>();
         GroupConcurrent = new ConcurrentDictionary<string, byte>();
     }
 
     private ConcurrentDictionary<string, IReadOnlyList<ConsumerExecutorDescriptor>> Entries { get; }
+
+    // Secondary index: maps logical group name → shard descriptors for O(1) DB-retry fallback.
+    // Populated only for descriptors where LogicalGroupName is set (i.e. sharded/replica groups).
+    private ConcurrentDictionary<string, IReadOnlyList<ConsumerExecutorDescriptor>> BaseGroupEntries { get; }
 
     private ConcurrentDictionary<string, byte> GroupConcurrent { get; }
 
@@ -30,7 +34,7 @@ public class MethodMatcherCache
     /// </summary>
     public ConcurrentDictionary<string, IReadOnlyList<ConsumerExecutorDescriptor>> GetCandidatesMethodsOfGroupNameGrouped()
     {
-        if (Entries.Count != 0) return Entries;
+        if (!Entries.IsEmpty) return Entries;
 
         var executorCollection = _selector.SelectCandidates();
 
@@ -42,23 +46,22 @@ public class MethodMatcherCache
 
         var groupedCandidates = executorCollection.GroupBy(x => x.Attribute.Group);
 
-        foreach (var item in groupedCandidates) Entries.TryAdd(item.Key, item.ToList());
+        foreach (var item in groupedCandidates)
+        {
+            var descriptors = item.ToList();
+            Entries.TryAdd(item.Key, descriptors);
+
+            var baseGroup = descriptors[0].LogicalGroupName;
+            if (baseGroup != null)
+                BaseGroupEntries.TryAdd(baseGroup, descriptors);
+        }
 
         return Entries;
     }
 
     public byte GetGroupConcurrentLimit(string group)
     {
-        return GroupConcurrent.TryGetValue(group, out byte value) ? value : (byte)1;
-    }
-
-    public List<string> GetAllTopics()
-    {
-        if (Entries.Count == 0) GetCandidatesMethodsOfGroupNameGrouped();
-
-        var result = new List<string>();
-        foreach (var item in Entries.Values) result.AddRange(item.Select(x => x.TopicName));
-        return result;
+        return GroupConcurrent.GetValueOrDefault(group, (byte)1);
     }
 
     /// <summary>
@@ -72,14 +75,21 @@ public class MethodMatcherCache
     public bool TryGetTopicExecutor(string topicName, string groupName,
         [NotNullWhen(true)] out ConsumerExecutorDescriptor? matchTopic)
     {
-        if (Entries == null) throw new ArgumentNullException(nameof(Entries));
-
         matchTopic = null;
 
+        // Exact match — normal path for both standard and sharded consumers.
         if (Entries.TryGetValue(groupName, out var groupMatchTopics))
         {
             matchTopic = _selector.SelectBestCandidate(topicName, groupMatchTopics);
+            return matchTopic != null;
+        }
 
+        // fallback for sharded consumer groups: when a shard consumer writes a message to DB
+        // it uses the logical group name as the group header, so retried messages arrive here
+        // with the logical group name rather than the shard-specific group name.
+        if (BaseGroupEntries.TryGetValue(groupName, out var baseGroupMatchTopics))
+        {
+            matchTopic = _selector.SelectBestCandidate(topicName, baseGroupMatchTopics);
             return matchTopic != null;
         }
 

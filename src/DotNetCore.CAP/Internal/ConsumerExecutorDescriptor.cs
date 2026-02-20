@@ -29,6 +29,15 @@ public class ConsumerExecutorDescriptor
     public string? TopicNamePrefix { get; set; }
 
     /// <summary>
+    /// The logical (base) group name when this descriptor represents a shard/replica of a group.
+    /// For example, when Attribute.Group is "myapp.queue.v1.replica.0", this is "myapp.queue.v1".
+    /// Null for standard (non-sharded) consumers.
+    /// When set, MethodMatcherCache builds a secondary index so that DB-retried messages stored
+    /// with the logical group name can still find the correct executor in O(1) time.
+    /// </summary>
+    public string? LogicalGroupName { get; set; }
+
+    /// <summary>
     /// Topic name based on both <see cref="Attribute" /> and <see cref="ClassAttribute" />.
     /// </summary>
     public string TopicName
