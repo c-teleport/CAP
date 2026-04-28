@@ -81,7 +81,8 @@ public class MethodMatcherCache
         if (Entries.TryGetValue(groupName, out var groupMatchTopics))
         {
             matchTopic = _selector.SelectBestCandidate(topicName, groupMatchTopics);
-            return matchTopic != null;
+            if (matchTopic != null)
+                return true;
         }
 
         // fallback for sharded consumer groups: when a shard consumer writes a message to DB
