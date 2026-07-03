@@ -21,6 +21,13 @@ public interface IDataStorage
 
     Task ChangePublishStateToDelayedAsync(string[] ids);
 
+    /// <summary>
+    /// Moves the given received messages to the <see cref="StatusName.RetryImmediately"/> status so the retry
+    /// processor re-executes them on its next poll, bypassing the <c>FallbackWindowLookbackSeconds</c> window.
+    /// Used during graceful shutdown for consumed messages that could not finish executing.
+    /// </summary>
+    Task ChangeReceiveStateToImmediateRetryAsync(string[] ids);
+
     Task ChangePublishStateAsync(MediumMessage message, StatusName state, object? transaction = null);
 
     Task ChangeReceiveStateAsync(MediumMessage message, StatusName state);

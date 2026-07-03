@@ -47,6 +47,18 @@ public interface IConsumerClient : IAsyncDisposable
     Task ListeningAsync(TimeSpan timeout, CancellationToken cancellationToken);
 
     /// <summary>
+    /// Requests the broker to stop delivering new messages to this consumer, while keeping the underlying
+    /// connection open so in-flight messages can still be committed or rejected. Used during graceful shutdown
+    /// to drain already-consumed messages without receiving new ones. The default implementation is a no-op for
+    /// transports that do not support pausing intake.
+    /// </summary>
+    /// <returns>A task that represents the asynchronous stop operation</returns>
+    Task StopReceivingAsync()
+    {
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
     /// Manually commits message offset when the message consumption is complete
     /// </summary>
     /// <param name="sender">The message or context object to commit</param>

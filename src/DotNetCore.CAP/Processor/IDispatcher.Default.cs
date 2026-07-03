@@ -33,6 +33,10 @@ public class Dispatcher : IDispatcher
     private Channel<(MediumMessage, ConsumerExecutorDescriptor?)> _receivedChannel = default!;
     private bool _disposed;
 
+    // Retained worker handles so shutdown can await them (the loops are otherwise unreachable). See DrainReceivedAsync.
+    private Task? _sendingTask;
+    private Task[]? _processingTasks;
+
     public Dispatcher(
         ILogger<Dispatcher> logger,
         IMessageSender sender,
@@ -52,7 +56,7 @@ public class Dispatcher : IDispatcher
 
     #region Public Methods
 
-    public async ValueTask StartAsync(CancellationToken stoppingToken)
+    public ValueTask StartAsync(CancellationToken stoppingToken)
     {
         ResetStateIfNeeded();
 
@@ -60,15 +64,23 @@ public class Dispatcher : IDispatcher
         _tasksCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken, CancellationToken.None);
 
         InitializePublishedChannel();
-        await StartSendingTaskAsync().ConfigureAwait(false);
+
+        // Launch the worker loops and retain the real Task handles (do not await them here - StartAsync must
+        // return immediately). The handles let DrainReceivedAsync await orderly completion on shutdown.
+        _sendingTask = Task.Run(() => SendingAsync().AsTask(), _tasksCts.Token);
 
         if (_enableParallelExecute)
         {
             InitializeReceivedChannel();
-            await StartProcessingTasksAsync().ConfigureAwait(false);
+            _processingTasks = Enumerable
+                .Range(0, _options.SubscriberParallelExecuteThreadCount)
+                .Select(_ => Task.Run(() => ProcessingAsync().AsTask(), _tasksCts!.Token))
+                .ToArray();
         }
 
         _ = StartSchedulerTaskAsync().ConfigureAwait(false);
+
+        return ValueTask.CompletedTask;
     }
 
     public async Task EnqueueToScheduler(MediumMessage message, DateTime publishTime, object? transaction = null)
@@ -111,31 +123,114 @@ public class Dispatcher : IDispatcher
         }
     }
 
-    public async ValueTask EnqueueToExecute(MediumMessage message, ConsumerExecutorDescriptor? descriptor = null)
+    public async ValueTask<bool> EnqueueToExecute(MediumMessage message, ConsumerExecutorDescriptor? descriptor = null)
     {
         try
         {
             if (IsCancellationRequested())
             {
-                return;
+                return false;
             }
 
             if (ShouldUseParallelExecute(message))
             {
-                await WriteToChannelAsync(_receivedChannel, (message, descriptor)).ConfigureAwait(false);
+                // Buffered for parallel execution. If the channel is completed (shutdown drain), this returns
+                // false so the caller can return the message to the broker.
+                return await WriteToChannelAsync(_receivedChannel, (message, descriptor)).ConfigureAwait(false);
             }
-            else
-            {
-                await _executor.ExecuteAsync(message, descriptor, _tasksCts!.Token).ConfigureAwait(false);
-            }
+
+            await _executor.ExecuteAsync(message, descriptor, _tasksCts!.Token).ConfigureAwait(false);
+            return true;
         }
         catch (OperationCanceledException)
         {
-            // Expected during shutdown
+            // Interrupted by shutdown before the message could be executed/buffered. Report not-accepted so
+            // the caller returns it to the broker for redelivery.
+            return false;
         }
         catch (Exception e)
         {
             _logger.LogError(e, "An exception occurred when invoke subscriber. MessageId:{MessageId}", message.DbId);
+            // The executor persists failures itself (Failed state, DB retry); treat as accepted so the message
+            // is not also redelivered by the broker.
+            return true;
+        }
+    }
+
+    public async Task DrainReceivedAsync(TimeSpan grace)
+    {
+        // Only the received (subscriber) path is drained here; the publish path keeps its existing behavior.
+        // In synchronous (non-parallel) mode there is no in-memory received buffer - execution happens inline
+        // inside the consumer callback and completes (or is rejected) there - so there is nothing to drain.
+        if (!_enableParallelExecute || _receivedChannel == null)
+        {
+            return;
+        }
+
+        // Stop accepting new received messages; buffered items keep flowing to the processing loops.
+        _receivedChannel.Writer.TryComplete();
+
+        var buffered = _receivedChannel.Reader.CanCount ? _receivedChannel.Reader.Count : -1;
+        _logger.LogInformation(
+            "Draining {Count} buffered received message(s) within {Grace}.",
+            buffered < 0 ? (object)"pending" : buffered, grace);
+
+        var processing = _processingTasks;
+        if (processing == null || processing.Length == 0)
+        {
+            return;
+        }
+
+        try
+        {
+            // With _tasksCts still alive, the processing loops drain the channel and exit once it is empty.
+            await Task.WhenAll(processing).WaitAsync(grace).ConfigureAwait(false);
+            return;
+        }
+        catch (TimeoutException)
+        {
+            _logger.LogWarning(
+                "Graceful drain did not finish within {Grace}. Remaining buffered received messages will be flagged for immediate retry.",
+                grace);
+        }
+        catch (OperationCanceledException)
+        {
+            // Hard-abort token fired while draining; fall through to flag whatever is still buffered.
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "An error occurred while draining received messages during shutdown.");
+        }
+
+        await FlagRemainingBufferedForImmediateRetryAsync().ConfigureAwait(false);
+    }
+
+    private async Task FlagRemainingBufferedForImmediateRetryAsync()
+    {
+        if (!_options.EnableImmediateRetryOnShutdown)
+        {
+            return;
+        }
+
+        var ids = new List<string>();
+        while (_receivedChannel.Reader.TryRead(out var messageData))
+        {
+            ids.Add(messageData.Item1.DbId);
+        }
+
+        if (ids.Count == 0)
+        {
+            return;
+        }
+
+        try
+        {
+            _logger.LogInformation("Updating {Count} received message(s) to the RetryImmediately state on shutdown.", ids.Count);
+            await _storage.ChangeReceiveStateToImmediateRetryAsync(ids.ToArray()).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to flag received messages for immediate retry on shutdown.");
         }
     }
 
@@ -193,21 +288,6 @@ public class Dispatcher : IDispatcher
     #endregion
 
     #region Task Startup Methods
-
-    private async Task StartSendingTaskAsync()
-    {
-        await Task.Run(SendingAsync, _tasksCts!.Token).ConfigureAwait(false);
-    }
-
-    private async Task StartProcessingTasksAsync()
-    {
-        var processingTasks = Enumerable
-            .Range(0, _options.SubscriberParallelExecuteThreadCount)
-            .Select(_ => Task.Run(ProcessingAsync, _tasksCts!.Token))
-            .ToArray();
-
-        await Task.WhenAll(processingTasks).ConfigureAwait(false);
-    }
 
     private Task StartSchedulerTaskAsync()
     {
@@ -434,18 +514,23 @@ public class Dispatcher : IDispatcher
         return _enableParallelExecute && message.Retries == 0;
     }
 
-    private async ValueTask WriteToChannelAsync<T>(Channel<T> channel, T item)
+    private async ValueTask<bool> WriteToChannelAsync<T>(Channel<T> channel, T item)
     {
-        if (!channel.Writer.TryWrite(item))
+        if (channel.Writer.TryWrite(item))
         {
-            while (await channel.Writer.WaitToWriteAsync(_tasksCts!.Token).ConfigureAwait(false))
+            return true;
+        }
+
+        while (await channel.Writer.WaitToWriteAsync(_tasksCts!.Token).ConfigureAwait(false))
+        {
+            if (channel.Writer.TryWrite(item))
             {
-                if (channel.Writer.TryWrite(item))
-                {
-                    break;
-                }
+                return true;
             }
         }
+
+        // The channel has been completed (shutdown drain) - the item was not written.
+        return false;
     }
 
     #endregion

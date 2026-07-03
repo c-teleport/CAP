@@ -2,6 +2,7 @@
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
@@ -41,6 +42,13 @@ internal class ConsumerRegister : IConsumerRegister
     private ISerializer _serializer = default!;
     private BrokerAddress _serverAddress;
     private IDataStorage _storage = default!;
+
+    // Active listening clients, retained so shutdown can ask them to stop receiving (see StopReceivingAsync).
+    private readonly ConcurrentBag<IConsumerClient> _clients = new();
+
+    // Number of received-message callbacks currently in flight. In synchronous mode this includes the full
+    // subscriber execution, so shutdown can wait for it (see WaitForInflightMessagesAsync).
+    private int _inflightMessages;
 
     public ConsumerRegister(ILogger<ConsumerRegister> logger, IServiceProvider serviceProvider)
     {
@@ -83,6 +91,49 @@ internal class ConsumerRegister : IConsumerRegister
         }
     }
 
+    public async Task StopReceivingAsync()
+    {
+        _logger.LogInformation("Stopping {Count} consumer client(s) from receiving new messages.", _clients.Count);
+
+        foreach (var client in _clients)
+        {
+            try
+            {
+                await client.StopReceivingAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Error while requesting a consumer client to stop receiving during shutdown.");
+            }
+        }
+    }
+
+    public async Task WaitForInflightMessagesAsync(TimeSpan timeout)
+    {
+        var inflight = Volatile.Read(ref _inflightMessages);
+        if (timeout <= TimeSpan.Zero || inflight == 0)
+        {
+            return;
+        }
+
+        _logger.LogInformation("Waiting up to {Timeout} for {Count} in-flight received message(s) to finish.", timeout, inflight);
+
+        using var cts = new CancellationTokenSource(timeout);
+        try
+        {
+            while (Volatile.Read(ref _inflightMessages) > 0)
+            {
+                await Task.Delay(50, cts.Token).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogWarning(
+                "Timed out after {Timeout} waiting for {Count} in-flight received message(s) to finish during shutdown.",
+                timeout, Volatile.Read(ref _inflightMessages));
+        }
+    }
+
     public void Dispose()
     {
         if (Interlocked.CompareExchange(ref _disposed, 1, 0) == 1)
@@ -109,6 +160,10 @@ internal class ConsumerRegister : IConsumerRegister
 
     public async ValueTask ExecuteAsync()
     {
+        // Drop references to clients from a previous run (e.g. after a health-check restart); the old
+        // clients are disposed when their listening tasks unwind.
+        _clients.Clear();
+
         var groupingMatches = _selector.GetCandidatesMethodsOfGroupNameGrouped();
 
         foreach (var matchGroup in groupingMatches)
@@ -136,6 +191,8 @@ internal class ConsumerRegister : IConsumerRegister
                       try
                       {
                           await using var client = await _consumerClientFactory.CreateAsync(matchGroup.Key, limit);
+
+                          _clients.Add(client);
 
                           _serverAddress = client.BrokerAddress;
 
@@ -170,6 +227,7 @@ internal class ConsumerRegister : IConsumerRegister
         client.OnLogCallback = WriteLog;
         client.OnMessageCallback = async (transportMessage, sender) =>
         {
+            Interlocked.Increment(ref _inflightMessages);
             long? tracingTimestamp = null;
             try
             {
@@ -255,10 +313,23 @@ internal class ConsumerRegister : IConsumerRegister
 
                     TracingAfter(tracingTimestamp, transportMessage, _serverAddress);
 
-                    await _dispatcher.EnqueueToExecute(mediumMessage, executor!);
+                    var accepted = await _dispatcher.EnqueueToExecute(mediumMessage, executor!);
 
-                    await client.CommitAsync(sender);
-
+                    if (accepted)
+                    {
+                        await client.CommitAsync(sender);
+                    }
+                    else
+                    {
+                        // CAP is shutting down before this message could be executed/buffered. Remove the row we
+                        // just stored and return the message to the broker so it is redelivered (in order, with
+                        // prefetch=1) instead of being double-executed later via the DB fallback retry.
+                        _logger.LogInformation(
+                            "Message '{MessageId}' was not enqueued (CAP is shutting down); deleting it from storage and returning it to the broker.",
+                            mediumMessage.DbId);
+                        await _storage.DeleteReceivedMessageAsync(long.Parse(mediumMessage.DbId));
+                        await client.RejectAsync(sender);
+                    }
                 }
             }
             catch (Exception e)
@@ -269,6 +340,10 @@ internal class ConsumerRegister : IConsumerRegister
                 await client.RejectAsync(sender);
 
                 TracingError(tracingTimestamp, transportMessage, client.BrokerAddress, e);
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _inflightMessages);
             }
         };
     }

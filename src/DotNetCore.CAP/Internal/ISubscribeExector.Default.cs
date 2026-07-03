@@ -100,6 +100,10 @@ internal class SubscribeExecutor : ISubscribeExecutor
 
             sp.Stop();
 
+            // Do not mark a message as succeeded if execution was interrupted by a shutdown/cancellation.
+            // Leaving it in its current (Scheduled) state keeps it recoverable by the retry processor.
+            cancellationToken.ThrowIfCancellationRequested();
+
             await SetSuccessfulState(message).ConfigureAwait(false);
 
             CapEventCounterSource.Log.WriteInvokeTimeMetrics(sp.Elapsed.TotalMilliseconds);
@@ -107,6 +111,12 @@ internal class SubscribeExecutor : ISubscribeExecutor
                 descriptor.Attribute.Group, sp.Elapsed.TotalMilliseconds, message.Origin.GetExecutionInstanceId());
 
             return (false, OperateResult.Success);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Interrupted by shutdown. Do not mark the message succeeded or failed (which would consume a
+            // retry attempt); let it propagate so the message stays recoverable in its current state.
+            throw;
         }
         catch (Exception ex)
         {
@@ -195,9 +205,11 @@ internal class SubscribeExecutor : ISubscribeExecutor
                     .PublishAsync(ret.CallbackName, ret.Result, ret.CallbackHeader, cancellationToken).ConfigureAwait(false);
             }
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            //ignore
+            // Interrupted by shutdown. Propagate so the caller leaves the message recoverable instead of
+            // marking it succeeded.
+            throw;
         }
         catch (Exception ex)
         {

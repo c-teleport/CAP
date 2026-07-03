@@ -101,6 +101,15 @@ public class PostgreSqlDataStorage : IDataStorage
         await connection.ExecuteNonQueryAsync(sql).ConfigureAwait(false);
     }
 
+    public async Task ChangeReceiveStateToImmediateRetryAsync(string[] ids)
+    {
+        var sql =
+            $"UPDATE {_recName} SET \"StatusName\"='{StatusName.RetryImmediately}' WHERE \"Id\" IN ({string.Join(',', ids)});";
+        var connection = _options.Value.CreateConnection();
+        await using var _ = connection.ConfigureAwait(false);
+        await connection.ExecuteNonQueryAsync(sql).ConfigureAwait(false);
+    }
+
     public async Task ChangePublishStateAsync(MediumMessage message, StatusName state, object? transaction = null)
     {
         await ChangeMessageStateAsync(_pubName, message, state, transaction).ConfigureAwait(false);
@@ -229,7 +238,7 @@ public class PostgreSqlDataStorage : IDataStorage
 
     public async Task<IEnumerable<MediumMessage>> GetReceivedMessagesOfNeedRetry(TimeSpan lookbackSeconds)
     {
-        return await GetMessagesOfNeedRetryAsync(_recName, lookbackSeconds).ConfigureAwait(false);
+        return await GetMessagesOfNeedRetryAsync(_recName, lookbackSeconds, includeImmediateRetry: true).ConfigureAwait(false);
     }
 
     public async Task<int> DeleteReceivedMessageAsync(long id)
@@ -342,12 +351,19 @@ public class PostgreSqlDataStorage : IDataStorage
         await connection.ExecuteNonQueryAsync(sql, sqlParams: sqlParams).ConfigureAwait(false);
     }
 
-    private async Task<IEnumerable<MediumMessage>> GetMessagesOfNeedRetryAsync(string tableName, TimeSpan lookbackSeconds)
+    private async Task<IEnumerable<MediumMessage>> GetMessagesOfNeedRetryAsync(string tableName, TimeSpan lookbackSeconds,
+        bool includeImmediateRetry = false)
     {
         var fourMinAgo = DateTime.Now.Subtract(lookbackSeconds);
+
+        // Messages flagged for immediate retry on graceful shutdown bypass the lookback window.
+        var immediateRetryClause = includeImmediateRetry
+            ? $" OR \"StatusName\"='{StatusName.RetryImmediately}'"
+            : string.Empty;
+
         var sql =
             $"SELECT \"Id\",\"Content\",\"Retries\",\"Added\" FROM {tableName} WHERE \"Retries\"<@Retries " +
-            $"AND \"Version\"=@Version AND \"Added\"<@Added AND \"StatusName\" IN ('{StatusName.Failed}','{StatusName.Scheduled}') LIMIT 200;";
+            $"AND \"Version\"=@Version AND ((\"Added\"<@Added AND \"StatusName\" IN ('{StatusName.Failed}','{StatusName.Scheduled}')){immediateRetryClause}) LIMIT 200;";
 
         object[] sqlParams =
         {
