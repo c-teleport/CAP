@@ -294,14 +294,10 @@ public class MongoDBDataStorage : IDataStorage
         var collection = _database.GetCollection<ReceivedMessage>(_options.Value.ReceivedCollection);
         var queryResult = await collection
             .Find(x => x.Retries < _capOptions.Value.FailedRetryCount
-                       && x.Version == _capOptions.Value.Version
                        && ((x.Added < fourMinAgo
                             && (x.StatusName == nameof(StatusName.Failed) ||
                                 x.StatusName == nameof(StatusName.Scheduled)))
                            || x.StatusName == nameof(StatusName.RetryImmediately)))
-                       && x.Added < fourMinAgo
-                       && (x.StatusName == nameof(StatusName.Failed) ||
-                           x.StatusName == nameof(StatusName.Scheduled)))
             .SortBy(x => x.Added)
             .Limit(200)
             .ToListAsync().ConfigureAwait(false);
