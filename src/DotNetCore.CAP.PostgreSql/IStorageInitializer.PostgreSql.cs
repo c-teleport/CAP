@@ -76,8 +76,11 @@ CREATE TABLE IF NOT EXISTS {GetReceivedTableName()}(
 	""StatusName"" VARCHAR(50) NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS ""idx_received_ExpiresAt_StatusName"" ON {GetReceivedTableName()} (""ExpiresAt"",""StatusName"");
-CREATE INDEX IF NOT EXISTS ""idx_received_Version_ExpiresAt_StatusName"" ON {GetReceivedTableName()} (""Version"",""ExpiresAt"",""StatusName"");
+
+CREATE INDEX IF NOT EXISTS ""idx_received_StatusName_ExpiresAt"" ON {GetReceivedTableName()} (""StatusName"",""ExpiresAt"");
+CREATE INDEX IF NOT EXISTS ""idx_received_StatusName_Added"" ON {GetReceivedTableName()} (""StatusName"",""Added"");
+DROP INDEX IF EXISTS ""idx_received_ExpiresAt_StatusName"";
+DROP INDEX IF EXISTS ""idx_received_Version_ExpiresAt_StatusName"";
 
 CREATE TABLE IF NOT EXISTS {GetPublishedTableName()}(
 	""Id"" BIGINT PRIMARY KEY NOT NULL,
@@ -90,8 +93,11 @@ CREATE TABLE IF NOT EXISTS {GetPublishedTableName()}(
 	""StatusName"" VARCHAR(50) NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS ""idx_published_ExpiresAt_StatusName"" ON {GetPublishedTableName()}(""ExpiresAt"",""StatusName"");
-CREATE INDEX IF NOT EXISTS ""idx_published_Version_ExpiresAt_StatusName"" ON {GetPublishedTableName()} (""Version"",""ExpiresAt"",""StatusName"");";
+
+CREATE INDEX IF NOT EXISTS ""idx_published_StatusName_ExpiresAt"" ON {GetPublishedTableName()} (""StatusName"",""ExpiresAt"");
+CREATE INDEX IF NOT EXISTS ""idx_published_StatusName_Added"" ON {GetPublishedTableName()} (""StatusName"",""Added"");
+DROP INDEX IF EXISTS ""idx_published_ExpiresAt_StatusName"";
+DROP INDEX IF EXISTS ""idx_published_Version_ExpiresAt_StatusName"";";
 
         if (_capOptions.Value.UseStorageLock)
             batchSql += $@"

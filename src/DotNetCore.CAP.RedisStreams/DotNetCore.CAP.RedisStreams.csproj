@@ -5,6 +5,7 @@
 		<Nullable>enable</Nullable>
 		<PackageTags>$(PackageTags);RedisStreams</PackageTags>
 		<LangVersion>preview</LangVersion>
+		<PackageId>CTeleport.$(AssemblyName)</PackageId>
 	</PropertyGroup>
 
 	<PropertyGroup>

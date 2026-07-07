@@ -11,6 +11,8 @@ import axios from "axios";
 import VueI18n from 'vue-i18n'
 import * as zh from './assets/language/zh-cn'
 import * as en from './assets/language/en-us'
+import * as ru from './assets/language/ru-ru'
+import * as nl from './assets/language/nl-nl'
 //
 
 let baseURL = "";
@@ -58,6 +60,8 @@ const i18n = new VueI18n({
   messages: {
     'en-us': en.default,
     'zh-cn': zh.default,
+    'ru-ru': ru.default,
+    'nl-nl': nl.default,
   }
 })
 

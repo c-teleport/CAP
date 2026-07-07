@@ -4,6 +4,7 @@
     <TargetFramework>net8.0</TargetFramework>
 	<Nullable>enable</Nullable>
     <PackageTags>$(PackageTags);RabbitMQ</PackageTags>
+    <PackageId>CTeleport.$(AssemblyName)</PackageId>
   </PropertyGroup>
 
   <ItemGroup>

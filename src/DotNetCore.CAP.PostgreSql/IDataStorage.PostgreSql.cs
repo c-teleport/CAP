@@ -265,12 +265,11 @@ public class PostgreSqlDataStorage : IDataStorage
         CancellationToken token = default)
     {
         var sql =
-            $"SELECT \"Id\",\"Content\",\"Retries\",\"Added\",\"ExpiresAt\" FROM {_pubName} WHERE \"Version\"=@Version " +
-            $"AND ((\"ExpiresAt\"< @TwoMinutesLater AND \"StatusName\" = '{StatusName.Delayed}') OR (\"ExpiresAt\"< @OneMinutesAgo AND \"StatusName\" = '{StatusName.Queued}')) FOR UPDATE SKIP LOCKED LIMIT @BatchSize;";
+            $"SELECT \"Id\",\"Content\",\"Retries\",\"Added\",\"ExpiresAt\" FROM {_pubName} WHERE " +
+            $"((\"ExpiresAt\"< @TwoMinutesLater AND \"StatusName\" = '{StatusName.Delayed}') OR (\"ExpiresAt\"< @OneMinutesAgo AND \"StatusName\" = '{StatusName.Queued}')) ORDER BY \"Added\" FOR UPDATE SKIP LOCKED LIMIT @BatchSize;";
 
         var sqlParams = new object[]
         {
-            new NpgsqlParameter("@Version", _capOptions.Value.Version),
             new NpgsqlParameter("@TwoMinutesLater", DateTime.Now.AddMinutes(2)),
             new NpgsqlParameter("@OneMinutesAgo", QueuedMessageFetchTime()),
             new NpgsqlParameter("@BatchSize", _capOptions.Value.SchedulerBatchSize)
@@ -364,11 +363,11 @@ public class PostgreSqlDataStorage : IDataStorage
         var sql =
             $"SELECT \"Id\",\"Content\",\"Retries\",\"Added\" FROM {tableName} WHERE \"Retries\"<@Retries " +
             $"AND \"Version\"=@Version AND ((\"Added\"<@Added AND \"StatusName\" IN ('{StatusName.Failed}','{StatusName.Scheduled}')){immediateRetryClause}) LIMIT 200;";
+            $"AND \"Added\"<@Added AND \"StatusName\" IN ('{StatusName.Failed}','{StatusName.Scheduled}') ORDER BY \"Added\" LIMIT 200;";
 
         object[] sqlParams =
         {
             new NpgsqlParameter("@Retries", _capOptions.Value.FailedRetryCount),
-            new NpgsqlParameter("@Version", _capOptions.Value.Version),
             new NpgsqlParameter("@Added", fourMinAgo)
         };
 
