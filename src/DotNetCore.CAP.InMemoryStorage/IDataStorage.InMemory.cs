@@ -59,6 +59,19 @@ internal class InMemoryStorage : IDataStorage
         return Task.CompletedTask;
     }
 
+    public Task ChangeReceiveStateToImmediateRetryAsync(string[] ids)
+    {
+        foreach (var id in ids)
+        {
+            if (ReceivedMessages.TryGetValue(id, out var message))
+            {
+                message.StatusName = StatusName.RetryImmediately;
+            }
+        }
+
+        return Task.CompletedTask;
+    }
+
     public Task ChangePublishStateAsync(MediumMessage message, StatusName state, object? dbTransaction = null)
     {
         PublishedMessages[message.DbId].StatusName = state;
@@ -202,8 +215,9 @@ internal class InMemoryStorage : IDataStorage
     {
         IEnumerable<MediumMessage> result = ReceivedMessages.Values
             .Where(x => x.Retries < _capOptions.Value.FailedRetryCount
-                        && x.Added < DateTime.Now.Subtract(lookbackSeconds)
-                        && (x.StatusName == StatusName.Scheduled || x.StatusName == StatusName.Failed))
+                        && ((x.Added < DateTime.Now.Subtract(lookbackSeconds)
+                             && (x.StatusName == StatusName.Scheduled || x.StatusName == StatusName.Failed))
+                            || x.StatusName == StatusName.RetryImmediately))
             .Take(200)
             .Select(x => (MediumMessage)x).ToList();
 

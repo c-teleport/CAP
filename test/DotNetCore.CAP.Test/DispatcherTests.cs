@@ -233,6 +233,203 @@ public class DispatcherTests
         sender.ReceivedMessages.Select(m => m.DbId).Should().Equal(["3", "2", "1"]);
     }
 
+    [Fact]
+    public async Task EnqueueToExecute_ReturnsFalse_WhenCancellationRequested()
+    {
+        // Arrange
+        var options = Options.Create(new CapOptions { EnableSubscriberParallelExecute = false });
+        var dispatcher = new Dispatcher(_logger, new TestThreadSafeMessageSender(), options, _executor, _storage);
+        using var cts = new CancellationTokenSource();
+        await dispatcher.StartAsync(cts.Token);
+
+        // Act
+        await cts.CancelAsync();
+        var accepted = await dispatcher.EnqueueToExecute(CreateTestMessage());
+
+        // Assert
+        accepted.Should().BeFalse();
+        await _executor.DidNotReceive()
+            .ExecuteAsync(Arg.Any<MediumMessage>(), Arg.Any<ConsumerExecutorDescriptor>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task EnqueueToExecute_ReturnsTrue_AndExecutesInline_InSyncMode()
+    {
+        // Arrange
+        _executor.ExecuteAsync(Arg.Any<MediumMessage>(), Arg.Any<ConsumerExecutorDescriptor>(), Arg.Any<CancellationToken>())
+            .Returns(OperateResult.Success);
+        var options = Options.Create(new CapOptions { EnableSubscriberParallelExecute = false });
+        var dispatcher = new Dispatcher(_logger, new TestThreadSafeMessageSender(), options, _executor, _storage);
+        using var cts = new CancellationTokenSource();
+        await dispatcher.StartAsync(cts.Token);
+        var message = CreateTestMessage();
+
+        // Act
+        var accepted = await dispatcher.EnqueueToExecute(message);
+
+        // Assert
+        accepted.Should().BeTrue();
+        await _executor.Received(1)
+            .ExecuteAsync(message, Arg.Any<ConsumerExecutorDescriptor>(), Arg.Any<CancellationToken>());
+        await cts.CancelAsync();
+    }
+
+    [Fact]
+    public async Task EnqueueToExecute_ReturnsFalse_WhenChannelCompletedByDrain_InParallelMode()
+    {
+        // Arrange
+        var options = Options.Create(new CapOptions
+        {
+            EnableSubscriberParallelExecute = true,
+            SubscriberParallelExecuteThreadCount = 1,
+            SubscriberParallelExecuteBufferFactor = 10
+        });
+        var dispatcher = new Dispatcher(_logger, new TestThreadSafeMessageSender(), options, _executor, _storage);
+        using var cts = new CancellationTokenSource();
+        await dispatcher.StartAsync(cts.Token);
+
+        // Act - drain completes the received channel writer.
+        await dispatcher.DrainReceivedAsync(TimeSpan.FromSeconds(2));
+        var accepted = await dispatcher.EnqueueToExecute(CreateTestMessage());
+
+        // Assert
+        accepted.Should().BeFalse();
+        await cts.CancelAsync();
+    }
+
+    [Fact]
+    public async Task DrainReceivedAsync_ExecutesBufferedMessages_WithinGrace()
+    {
+        // Arrange
+        _executor.ExecuteAsync(Arg.Any<MediumMessage>(), Arg.Any<ConsumerExecutorDescriptor>(), Arg.Any<CancellationToken>())
+            .Returns(OperateResult.Success);
+        var options = Options.Create(new CapOptions
+        {
+            EnableSubscriberParallelExecute = true,
+            EnableImmediateRetryOnShutdown = true,
+            SubscriberParallelExecuteThreadCount = 1,
+            SubscriberParallelExecuteBufferFactor = 100
+        });
+        var dispatcher = new Dispatcher(_logger, new TestThreadSafeMessageSender(), options, _executor, _storage);
+        using var cts = new CancellationTokenSource();
+        await dispatcher.StartAsync(cts.Token);
+
+        for (var i = 1; i <= 5; i++)
+        {
+            (await dispatcher.EnqueueToExecute(CreateTestMessage(i.ToString()))).Should().BeTrue();
+        }
+
+        // Act
+        await dispatcher.DrainReceivedAsync(TimeSpan.FromSeconds(5));
+
+        // Assert - all buffered messages executed, nothing flagged for immediate retry.
+        await _executor.Received(5)
+            .ExecuteAsync(Arg.Any<MediumMessage>(), Arg.Any<ConsumerExecutorDescriptor>(), Arg.Any<CancellationToken>());
+        await _storage.DidNotReceive().ChangeReceiveStateToImmediateRetryAsync(Arg.Any<string[]>());
+        await cts.CancelAsync();
+    }
+
+    [Fact]
+    public async Task DrainReceivedAsync_FlagsRemainingForImmediateRetry_OnTimeout()
+    {
+        // Arrange - the executor blocks on the first message so the rest stay buffered.
+        var firstCallStarted = new TaskCompletionSource();
+        var blocker = new TaskCompletionSource<OperateResult>();
+        _executor.ExecuteAsync(Arg.Any<MediumMessage>(), Arg.Any<ConsumerExecutorDescriptor>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                firstCallStarted.TrySetResult();
+                return blocker.Task;
+            });
+
+        var options = Options.Create(new CapOptions
+        {
+            EnableSubscriberParallelExecute = true,
+            EnableImmediateRetryOnShutdown = true,
+            SubscriberParallelExecuteThreadCount = 1,
+            SubscriberParallelExecuteBufferFactor = 100
+        });
+        var dispatcher = new Dispatcher(_logger, new TestThreadSafeMessageSender(), options, _executor, _storage);
+        using var cts = new CancellationTokenSource();
+        await dispatcher.StartAsync(cts.Token);
+
+        for (var i = 1; i <= 5; i++)
+        {
+            (await dispatcher.EnqueueToExecute(CreateTestMessage(i.ToString()))).Should().BeTrue();
+        }
+
+        // Ensure exactly one message is picked up (and stuck) before draining; the other 4 remain buffered.
+        await firstCallStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // Act - drain cannot finish because the executor is blocked.
+        await dispatcher.DrainReceivedAsync(TimeSpan.FromMilliseconds(300));
+
+        // Assert - the 4 still-buffered messages are flagged for immediate retry.
+        await _storage.Received(1)
+            .ChangeReceiveStateToImmediateRetryAsync(Arg.Is<string[]>(ids => ids.Length == 4));
+
+        blocker.TrySetResult(OperateResult.Success);
+        await cts.CancelAsync();
+    }
+
+    [Fact]
+    public async Task DrainReceivedAsync_DoesNotFlag_WhenImmediateRetryDisabled()
+    {
+        // Arrange
+        var firstCallStarted = new TaskCompletionSource();
+        var blocker = new TaskCompletionSource<OperateResult>();
+        _executor.ExecuteAsync(Arg.Any<MediumMessage>(), Arg.Any<ConsumerExecutorDescriptor>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                firstCallStarted.TrySetResult();
+                return blocker.Task;
+            });
+
+        var options = Options.Create(new CapOptions
+        {
+            EnableSubscriberParallelExecute = true,
+            EnableImmediateRetryOnShutdown = false,
+            SubscriberParallelExecuteThreadCount = 1,
+            SubscriberParallelExecuteBufferFactor = 100
+        });
+        var dispatcher = new Dispatcher(_logger, new TestThreadSafeMessageSender(), options, _executor, _storage);
+        using var cts = new CancellationTokenSource();
+        await dispatcher.StartAsync(cts.Token);
+
+        for (var i = 1; i <= 5; i++)
+        {
+            await dispatcher.EnqueueToExecute(CreateTestMessage(i.ToString()));
+        }
+
+        await firstCallStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // Act
+        await dispatcher.DrainReceivedAsync(TimeSpan.FromMilliseconds(300));
+
+        // Assert
+        await _storage.DidNotReceive().ChangeReceiveStateToImmediateRetryAsync(Arg.Any<string[]>());
+
+        blocker.TrySetResult(OperateResult.Success);
+        await cts.CancelAsync();
+    }
+
+    [Fact]
+    public async Task DrainReceivedAsync_IsNoOp_InSyncMode()
+    {
+        // Arrange
+        var options = Options.Create(new CapOptions { EnableSubscriberParallelExecute = false });
+        var dispatcher = new Dispatcher(_logger, new TestThreadSafeMessageSender(), options, _executor, _storage);
+        using var cts = new CancellationTokenSource();
+        await dispatcher.StartAsync(cts.Token);
+
+        // Act
+        await dispatcher.DrainReceivedAsync(TimeSpan.FromSeconds(1));
+
+        // Assert - nothing to drain, nothing flagged.
+        await _storage.DidNotReceive().ChangeReceiveStateToImmediateRetryAsync(Arg.Any<string[]>());
+        await cts.CancelAsync();
+    }
+
     private MediumMessage CreateTestMessage(string id = "1")
     {
         return new MediumMessage()

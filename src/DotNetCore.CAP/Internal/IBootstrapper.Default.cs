@@ -6,9 +6,11 @@ using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using DotNetCore.CAP.Persistence;
+using DotNetCore.CAP.Transport;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 namespace DotNetCore.CAP.Internal;
 
@@ -119,9 +121,63 @@ internal class Bootstrapper : BackgroundService, IBootstrapper
 
     public override async Task StopAsync(CancellationToken cancellationToken)
     {
+        _logger.LogInformation("### CAP shutdown signal received.");
+
+        // Graceful shutdown: stop pulling new messages and finish already-consumed ones before hard-cancelling.
+        await GracefulDrainAsync().ConfigureAwait(false);
+
         _cts?.Cancel();
 
         await base.StopAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task GracefulDrainAsync()
+    {
+        if (_cts == null || _cts.IsCancellationRequested)
+        {
+            return;
+        }
+
+        try
+        {
+            var grace = _serviceProvider.GetRequiredService<IOptions<CapOptions>>().Value.GracefulShutdownTimeout;
+            if (grace <= TimeSpan.Zero)
+            {
+                return;
+            }
+
+            _logger.LogInformation("### CAP graceful shutdown draining consumed messages (timeout: {Grace}).", grace);
+
+            var deadline = DateTime.UtcNow + grace;
+
+            // 1) Ask consumers to stop receiving new messages (connections stay open to settle in-flight ones).
+            var consumerRegister = _serviceProvider.GetService<IConsumerRegister>();
+            if (consumerRegister != null)
+            {
+                await consumerRegister.StopReceivingAsync().ConfigureAwait(false);
+
+                // 2) Wait for in-flight received-message callbacks. In synchronous mode this is where the
+                //    subscriber execution completes.
+                await consumerRegister.WaitForInflightMessagesAsync(Remaining(deadline)).ConfigureAwait(false);
+            }
+
+            // 3) Drain messages buffered for parallel execution (no-op in synchronous mode).
+            var dispatcher = _serviceProvider.GetService<IDispatcher>();
+            if (dispatcher != null)
+            {
+                await dispatcher.DrainReceivedAsync(Remaining(deadline)).ConfigureAwait(false);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "An error occurred during CAP graceful shutdown drain; continuing with hard shutdown.");
+        }
+    }
+
+    private static TimeSpan Remaining(DateTime deadline)
+    {
+        var remaining = deadline - DateTime.UtcNow;
+        return remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero;
     }
 
     private void CheckRequirement()

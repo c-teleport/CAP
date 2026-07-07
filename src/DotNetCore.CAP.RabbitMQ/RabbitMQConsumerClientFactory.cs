@@ -12,12 +12,14 @@ internal sealed class RabbitMqConsumerClientFactory : IConsumerClientFactory
 {
     private readonly IConnectionChannelPool _connectionChannelPool;
     private readonly IOptions<RabbitMQOptions> _rabbitMqOptions;
+    private readonly CapOptions _capOptions;
     private readonly IServiceProvider _serviceProvider;
 
-    public RabbitMqConsumerClientFactory(IOptions<RabbitMQOptions> rabbitMqOptions, IConnectionChannelPool channelPool,
-        IServiceProvider serviceProvider)
+    public RabbitMqConsumerClientFactory(IOptions<RabbitMQOptions> rabbitMqOptions, IOptions<CapOptions> capOptions,
+        IConnectionChannelPool channelPool, IServiceProvider serviceProvider)
     {
         _rabbitMqOptions = rabbitMqOptions;
+        _capOptions = capOptions.Value;
         _connectionChannelPool = channelPool;
         _serviceProvider = serviceProvider;
     }
@@ -35,6 +37,16 @@ internal sealed class RabbitMqConsumerClientFactory : IConsumerClientFactory
 
     private async Task<IConsumerClient> CreateConsistentProcessingClientAsync(ConsistentHashMessagingTopology topology)
     {
+        if (_capOptions.EnableSubscriberParallelExecute)
+        {
+            throw new InvalidOperationException(
+                $"{nameof(CapOptions.EnableSubscriberParallelExecute)} cannot be enabled together with a consistent-hash " +
+                $"messaging topology (group '{topology.GroupName}', queue '{topology.QueueName}'). Parallel subscriber " +
+                "execution buffers consumed messages and processes them concurrently across worker threads, which breaks the " +
+                "per-key ordering and shard affinity that consistent-hash routing is meant to guarantee. Disable " +
+                $"{nameof(CapOptions.EnableSubscriberParallelExecute)} or stop using a consistent-hash topology for this group.");
+        }
+
         try
         {
             var client = new RabbitMqConsistentProcessingClient(topology, _connectionChannelPool, _rabbitMqOptions, _serviceProvider);

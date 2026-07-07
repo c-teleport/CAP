@@ -23,6 +23,7 @@ internal sealed class RabbitMqConsumerClient : IConsumerClient
     private readonly RabbitMQOptions _rabbitMqOptions;
     private RabbitMqBasicConsumer? _consumer;
     private IModel? _channel;
+    private string? _consumerTag;
 
     public RabbitMqConsumerClient(string groupName, byte groupConcurrent,
         IConnectionChannelPool connectionChannelPool,
@@ -73,7 +74,7 @@ internal sealed class RabbitMqConsumerClient : IConsumerClient
 
         try
         {
-            _channel!.BasicConsume(_queueName, false, _consumer);
+            _consumerTag = _channel!.BasicConsume(_queueName, false, _consumer);
         }
         catch (TimeoutException ex)
         {
@@ -87,6 +88,24 @@ internal sealed class RabbitMqConsumerClient : IConsumerClient
         }
 
         // ReSharper disable once FunctionNeverReturns
+    }
+
+    public async Task StopReceivingAsync()
+    {
+        // Cancel the consumer so RabbitMQ stops delivering new messages, but keep the channel open so any
+        // in-flight delivery callbacks can still ack/reject. The channel is disposed later in DisposeAsync.
+        var tag = _consumerTag;
+        if (tag != null && _channel is { IsOpen: true })
+        {
+            try
+            {
+                _channel.BasicCancel(tag);
+            }
+            catch (Exception)
+            {
+                // Best-effort during shutdown; the channel may already be closing.
+            }
+        }
     }
 
     public Task CommitAsync(object? sender)
