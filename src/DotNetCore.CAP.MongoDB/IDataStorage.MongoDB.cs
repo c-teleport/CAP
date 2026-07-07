@@ -105,6 +105,15 @@ public class MongoDBDataStorage : IDataStorage
         await collection.UpdateManyAsync(filter, updateDef).ConfigureAwait(false);
     }
 
+    public async Task ChangeReceiveStateToImmediateRetryAsync(string[] ids)
+    {
+        var collection = _database.GetCollection<ReceivedMessage>(_options.Value.ReceivedCollection);
+        var updateDef = Builders<ReceivedMessage>.Update.Set(x => x.StatusName, nameof(StatusName.RetryImmediately));
+        var filter = Builders<ReceivedMessage>.Filter.In(x => x.Id, ids.Select(long.Parse));
+
+        await collection.UpdateManyAsync(filter, updateDef).ConfigureAwait(false);
+    }
+
     public async Task ChangePublishStateAsync(MediumMessage message, StatusName state, object? transaction = null)
     {
         var collection = _database.GetCollection<PublishedMessage>(_options.Value.PublishedCollection);
@@ -285,9 +294,10 @@ public class MongoDBDataStorage : IDataStorage
         var collection = _database.GetCollection<ReceivedMessage>(_options.Value.ReceivedCollection);
         var queryResult = await collection
             .Find(x => x.Retries < _capOptions.Value.FailedRetryCount
-                       && x.Added < fourMinAgo
-                       && (x.StatusName == nameof(StatusName.Failed) ||
-                           x.StatusName == nameof(StatusName.Scheduled)))
+                       && ((x.Added < fourMinAgo
+                            && (x.StatusName == nameof(StatusName.Failed) ||
+                                x.StatusName == nameof(StatusName.Scheduled)))
+                           || x.StatusName == nameof(StatusName.RetryImmediately)))
             .SortBy(x => x.Added)
             .Limit(200)
             .ToListAsync().ConfigureAwait(false);

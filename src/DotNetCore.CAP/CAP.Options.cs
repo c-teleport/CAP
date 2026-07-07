@@ -36,6 +36,8 @@ public class CapOptions
         CollectorCleaningInterval = 300;
         FallbackWindowLookbackSeconds = 240;
         SchedulerBatchSize = 1000;
+        GracefulShutdownTimeout = TimeSpan.FromSeconds(20);
+        EnableImmediateRetryOnShutdown = true;
     }
 
     internal IList<ICapOptionsExtension> Extensions { get; }
@@ -154,6 +156,23 @@ public class CapOptions
     /// Default is 1,000.
     /// </summary>
     public int SchedulerBatchSize { get; set; }
+
+    /// <summary>
+    /// Gets or sets the maximum time the shutdown sequence will spend draining already-consumed messages
+    /// (finishing in-flight subscriber execution and buffered received messages) before hard-aborting.
+    /// The host's <c>HostOptions.ShutdownTimeout</c> must be set greater than or equal to this value for the
+    /// full window to be honored. Default is 20 seconds.
+    /// </summary>
+    public TimeSpan GracefulShutdownTimeout { get; set; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether received messages that cannot finish draining within
+    /// <see cref="GracefulShutdownTimeout"/> are moved to the <c>RetryImmediately</c> status so they are
+    /// re-executed on the next retry poll instead of waiting for the <see cref="FallbackWindowLookbackSeconds"/>
+    /// window. Safe because the shutting-down instance is the sole owner of those messages.
+    /// Default is true.
+    /// </summary>
+    public bool EnableImmediateRetryOnShutdown { get; set; }
 
     /// <summary>
     /// Gets or sets the JSON serialization options used for message content serialization and deserialization.
