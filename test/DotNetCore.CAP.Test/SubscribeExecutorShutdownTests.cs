@@ -71,6 +71,29 @@ public class SubscribeExecutorShutdownTests
         await _storage.Received(1).ChangeReceiveStateAsync(message, StatusName.Succeeded);
     }
 
+    [Fact]
+    public async Task ExecuteAsync_MarksSucceeded_WhenHandlerCompletes_AfterCancellationRequested()
+    {
+        // Arrange - the handler finishes its work; cancellation arrives too late to interrupt it.
+        using var cts = new CancellationTokenSource();
+        _invoker.InvokeAsync(Arg.Any<ConsumerContext>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                cts.Cancel();
+                return new ConsumerExecutedResult(null, "1", null, null);
+            });
+
+        var executor = CreateExecutor();
+        var message = CreateMediumMessage();
+
+        // Act
+        var result = await executor.ExecuteAsync(message, CreateDescriptor(), cts.Token);
+
+        // Assert - completed side effects must be recorded, otherwise the message is executed twice.
+        result.Succeeded.Should().BeTrue();
+        await _storage.Received(1).ChangeReceiveStateAsync(message, StatusName.Succeeded);
+    }
+
     private static ConsumerExecutorDescriptor CreateDescriptor() => new()
     {
         Attribute = new CandidatesTopic("test.topic"),
