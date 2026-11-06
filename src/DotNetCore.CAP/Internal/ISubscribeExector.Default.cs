@@ -100,10 +100,6 @@ internal class SubscribeExecutor : ISubscribeExecutor
 
             sp.Stop();
 
-            // Do not mark a message as succeeded if execution was interrupted by a shutdown/cancellation.
-            // Leaving it in its current (Scheduled) state keeps it recoverable by the retry processor.
-            cancellationToken.ThrowIfCancellationRequested();
-
             await SetSuccessfulState(message).ConfigureAwait(false);
 
             CapEventCounterSource.Log.WriteInvokeTimeMetrics(sp.Elapsed.TotalMilliseconds);

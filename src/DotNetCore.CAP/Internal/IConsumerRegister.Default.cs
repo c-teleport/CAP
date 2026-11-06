@@ -50,6 +50,9 @@ internal class ConsumerRegister : IConsumerRegister
     // subscriber execution, so shutdown can wait for it (see WaitForInflightMessagesAsync).
     private int _inflightMessages;
 
+    // BasicCancel marks the register unhealthy; this blocks TransportCheckProcessor from restarting consumers mid-drain.
+    private volatile bool _stopping;
+
     public ConsumerRegister(ILogger<ConsumerRegister> logger, IServiceProvider serviceProvider)
     {
         _logger = logger;
@@ -73,6 +76,7 @@ internal class ConsumerRegister : IConsumerRegister
         _storage = _serviceProvider.GetRequiredService<IDataStorage>();
         _consumerClientFactory = _serviceProvider.GetRequiredService<IConsumerClientFactory>();
 
+        _stopping = false;
         await ExecuteAsync();
 
         _disposed = 0;
@@ -80,6 +84,11 @@ internal class ConsumerRegister : IConsumerRegister
 
     public async ValueTask ReStartAsync(bool force = false)
     {
+        if (_stopping)
+        {
+            return;
+        }
+
         if (!IsHealthy() || force)
         {
             Pulse();
@@ -93,6 +102,7 @@ internal class ConsumerRegister : IConsumerRegister
 
     public async Task StopReceivingAsync()
     {
+        _stopping = true;
         _logger.LogInformation("Stopping {Count} consumer client(s) from receiving new messages.", _clients.Count);
 
         foreach (var client in _clients)
