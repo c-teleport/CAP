@@ -63,7 +63,7 @@ internal class InMemoryStorage : IDataStorage
     {
         foreach (var id in ids)
         {
-            if (ReceivedMessages.TryGetValue(id, out var message))
+            if (ReceivedMessages.TryGetValue(id, out var message) && message.StatusName != StatusName.Succeeded)
             {
                 message.StatusName = StatusName.RetryImmediately;
             }

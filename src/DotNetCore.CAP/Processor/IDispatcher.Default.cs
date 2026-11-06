@@ -2,6 +2,7 @@
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
@@ -36,6 +37,9 @@ public class Dispatcher : IDispatcher
     // Retained worker handles so shutdown can await them (the loops are otherwise unreachable). See DrainReceivedAsync.
     private Task? _sendingTask;
     private Task[]? _processingTasks;
+
+    // Received messages currently inside a subscriber, so a timed-out drain can flag them too.
+    private readonly ConcurrentDictionary<string, byte> _executing = new();
 
     public Dispatcher(
         ILogger<Dispatcher> logger,
@@ -190,7 +194,7 @@ public class Dispatcher : IDispatcher
         catch (TimeoutException)
         {
             _logger.LogWarning(
-                "Graceful drain did not finish within {Grace}. Remaining buffered received messages will be flagged for immediate retry.",
+                "Graceful drain did not finish within {Grace}. Remaining buffered and in-flight received messages will be flagged for immediate retry.",
                 grace);
         }
         catch (OperationCanceledException)
@@ -202,17 +206,17 @@ public class Dispatcher : IDispatcher
             _logger.LogWarning(ex, "An error occurred while draining received messages during shutdown.");
         }
 
-        await FlagRemainingBufferedForImmediateRetryAsync().ConfigureAwait(false);
+        await FlagRemainingForImmediateRetryAsync().ConfigureAwait(false);
     }
 
-    private async Task FlagRemainingBufferedForImmediateRetryAsync()
+    private async Task FlagRemainingForImmediateRetryAsync()
     {
         if (!_options.EnableImmediateRetryOnShutdown)
         {
             return;
         }
 
-        var ids = new List<string>();
+        var ids = new List<string>(_executing.Keys);
         while (_receivedChannel.Reader.TryRead(out var messageData))
         {
             ids.Add(messageData.Item1.DbId);
@@ -480,9 +484,10 @@ public class Dispatcher : IDispatcher
 
     private async Task ProcessReceivedMessageAsync((MediumMessage, ConsumerExecutorDescriptor?) messageData)
     {
+        var (message, descriptor) = messageData;
+        _executing[message.DbId] = 0;
         try
         {
-            var (message, descriptor) = messageData;
             await _executor.ExecuteAsync(message, descriptor, _tasksCts!.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
@@ -491,7 +496,11 @@ public class Dispatcher : IDispatcher
         }
         catch (Exception e)
         {
-            _logger.LogError(e, "An exception occurred when invoke subscriber. MessageId:{MessageId}", messageData.Item1.DbId);
+            _logger.LogError(e, "An exception occurred when invoke subscriber. MessageId:{MessageId}", message.DbId);
+        }
+        finally
+        {
+            _executing.TryRemove(message.DbId, out _);
         }
     }
 

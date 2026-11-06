@@ -364,9 +364,10 @@ public class DispatcherTests
         // Act - drain cannot finish because the executor is blocked.
         await dispatcher.DrainReceivedAsync(TimeSpan.FromMilliseconds(300));
 
-        // Assert - the 4 still-buffered messages are flagged for immediate retry.
+        // Assert - the in-flight message and the 4 still-buffered ones are flagged for immediate retry.
         await _storage.Received(1)
-            .ChangeReceiveStateToImmediateRetryAsync(Arg.Is<string[]>(ids => ids.Length == 4));
+            .ChangeReceiveStateToImmediateRetryAsync(Arg.Is<string[]>(ids =>
+                ids.Length == 5 && ids.OrderBy(x => x).SequenceEqual(new[] { "1", "2", "3", "4", "5" })));
 
         blocker.TrySetResult(OperateResult.Success);
         await cts.CancelAsync();
