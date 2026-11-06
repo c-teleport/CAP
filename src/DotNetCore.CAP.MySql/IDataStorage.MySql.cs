@@ -107,7 +107,7 @@ public class MySqlDataStorage : IDataStorage
     public async Task ChangeReceiveStateToImmediateRetryAsync(string[] ids)
     {
         var sql =
-            $"UPDATE `{_recName}` SET `StatusName`='{StatusName.RetryImmediately}' WHERE `Id` IN ({string.Join(',', ids)});";
+            $"UPDATE `{_recName}` SET `StatusName`='{StatusName.RetryImmediately}' WHERE `Id` IN ({string.Join(',', ids)}) AND `StatusName`<>'{StatusName.Succeeded}';";
         var connection = new MySqlConnection(_options.Value.ConnectionString);
         await using var _ = connection.ConfigureAwait(false);
         await connection.ExecuteNonQueryAsync(sql).ConfigureAwait(false);

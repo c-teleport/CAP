@@ -109,7 +109,9 @@ public class MongoDBDataStorage : IDataStorage
     {
         var collection = _database.GetCollection<ReceivedMessage>(_options.Value.ReceivedCollection);
         var updateDef = Builders<ReceivedMessage>.Update.Set(x => x.StatusName, nameof(StatusName.RetryImmediately));
-        var filter = Builders<ReceivedMessage>.Filter.In(x => x.Id, ids.Select(long.Parse));
+        // A message may finish between being flagged and the host dying; never re-run a Succeeded one.
+        var filter = Builders<ReceivedMessage>.Filter.In(x => x.Id, ids.Select(long.Parse))
+                     & Builders<ReceivedMessage>.Filter.Ne(x => x.StatusName, nameof(StatusName.Succeeded));
 
         await collection.UpdateManyAsync(filter, updateDef).ConfigureAwait(false);
     }

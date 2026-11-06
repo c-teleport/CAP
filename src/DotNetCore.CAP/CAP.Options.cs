@@ -166,8 +166,8 @@ public class CapOptions
     public TimeSpan GracefulShutdownTimeout { get; set; }
 
     /// <summary>
-    /// Gets or sets a value indicating whether received messages that cannot finish draining within
-    /// <see cref="GracefulShutdownTimeout"/> are moved to the <c>RetryImmediately</c> status so they are
+    /// Gets or sets a value indicating whether received messages (buffered or still inside a subscriber) that
+    /// cannot finish within <see cref="GracefulShutdownTimeout"/> are moved to the <c>RetryImmediately</c> status so they are
     /// re-executed on the next retry poll instead of waiting for the <see cref="FallbackWindowLookbackSeconds"/>
     /// window. Safe because the shutting-down instance is the sole owner of those messages.
     /// Default is true.

@@ -71,6 +71,20 @@ public class ImmediateRetryStorageTests
             .Select(m => m.DbId).Should().NotContain(message.DbId);
     }
 
+    [Fact]
+    public async Task ChangeReceiveStateToImmediateRetry_LeavesSucceededMessageAlone()
+    {
+        var storage = CreateStorage();
+        var message = await storage.StoreReceivedMessageAsync("test.topic", "group", CreateMessage());
+        message.ExpiresAt = DateTime.Now.AddHours(1);
+        await storage.ChangeReceiveStateAsync(message, StatusName.Succeeded);
+
+        await storage.ChangeReceiveStateToImmediateRetryAsync(new[] { message.DbId });
+
+        (await storage.GetReceivedMessagesOfNeedRetry(Lookback))
+            .Select(m => m.DbId).Should().NotContain(message.DbId);
+    }
+
     private static Message CreateMessage() => new(
         new Dictionary<string, string>
         {
