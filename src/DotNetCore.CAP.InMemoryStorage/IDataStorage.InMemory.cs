@@ -72,6 +72,18 @@ internal class InMemoryStorage : IDataStorage
         return Task.CompletedTask;
     }
 
+    public Task ChangeReceiveStateToRetryStartedAsync(MediumMessage message)
+    {
+        message.Added = DateTime.Now;
+        if (ReceivedMessages.TryGetValue(message.DbId, out var stored))
+        {
+            stored.Added = message.Added;
+            stored.StatusName = StatusName.Scheduled;
+        }
+
+        return Task.CompletedTask;
+    }
+
     public Task ChangePublishStateAsync(MediumMessage message, StatusName state, object? dbTransaction = null)
     {
         PublishedMessages[message.DbId].StatusName = state;

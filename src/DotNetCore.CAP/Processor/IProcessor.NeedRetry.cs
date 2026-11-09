@@ -100,7 +100,12 @@ public class MessageNeedToRetryProcessor : IProcessor
         {
             context.ThrowIfStopping();
 
-            await _dispatcher.EnqueueToExecute(message).ConfigureAwait(false);
+            await connection.ChangeReceiveStateToRetryStartedAsync(message).ConfigureAwait(false);
+
+            // Rejected only while shutting down; hand the message straight to the next instance instead of
+            // letting it sit out the lookback window it was just given.
+            if (!await _dispatcher.EnqueueToExecute(message).ConfigureAwait(false))
+                await connection.ChangeReceiveStateToImmediateRetryAsync(new[] { message.DbId }).ConfigureAwait(false);
         }
 
         if (_options.Value.UseStorageLock)

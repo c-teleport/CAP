@@ -116,6 +116,17 @@ public class MongoDBDataStorage : IDataStorage
         await collection.UpdateManyAsync(filter, updateDef).ConfigureAwait(false);
     }
 
+    public async Task ChangeReceiveStateToRetryStartedAsync(MediumMessage message)
+    {
+        message.Added = DateTime.Now;
+        var collection = _database.GetCollection<ReceivedMessage>(_options.Value.ReceivedCollection);
+        var updateDef = Builders<ReceivedMessage>.Update
+            .Set(x => x.Added, message.Added)
+            .Set(x => x.StatusName, nameof(StatusName.Scheduled));
+
+        await collection.UpdateOneAsync(x => x.Id == long.Parse(message.DbId), updateDef).ConfigureAwait(false);
+    }
+
     public async Task ChangePublishStateAsync(MediumMessage message, StatusName state, object? transaction = null)
     {
         var collection = _database.GetCollection<PublishedMessage>(_options.Value.PublishedCollection);

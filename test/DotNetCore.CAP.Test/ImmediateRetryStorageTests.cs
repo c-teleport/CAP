@@ -42,15 +42,25 @@ public class ImmediateRetryStorageTests
         var storage = CreateStorage();
         var message = await storage.StoreReceivedMessageAsync("test.topic", "group", CreateMessage());
 
-        // Sanity: a freshly received message is not yet eligible (inside the lookback window).
-        (await storage.GetReceivedMessagesOfNeedRetry(Lookback))
-            .Select(m => m.DbId).Should().NotContain(message.DbId);
-
         await storage.ChangeReceiveStateToImmediateRetryAsync(new[] { message.DbId });
 
-        // After flagging, it is picked up immediately, bypassing the lookback window.
         (await storage.GetReceivedMessagesOfNeedRetry(Lookback))
             .Select(m => m.DbId).Should().Contain(message.DbId);
+    }
+
+    [Fact]
+    public async Task ChangeReceiveStateToRetryStarted_TakesMessageOutOfTheRetryQuery_WhileTheRetryRuns()
+    {
+        var storage = CreateStorage();
+        var message = await storage.StoreReceivedMessageAsync("test.topic", "group", CreateMessage());
+        await storage.ChangeReceiveStateToImmediateRetryAsync(new[] { message.DbId });
+        var picked = (await storage.GetReceivedMessagesOfNeedRetry(Lookback)).Single(m => m.DbId == message.DbId);
+
+        await storage.ChangeReceiveStateToRetryStartedAsync(picked);
+
+        picked.Added.Should().BeCloseTo(DateTime.Now, TimeSpan.FromSeconds(5));
+        (await storage.GetReceivedMessagesOfNeedRetry(Lookback))
+            .Select(m => m.DbId).Should().NotContain(message.DbId);
     }
 
     [Fact]
@@ -63,7 +73,6 @@ public class ImmediateRetryStorageTests
         (await storage.GetReceivedMessagesOfNeedRetry(Lookback))
             .Select(m => m.DbId).Should().Contain(message.DbId);
 
-        // Re-execution transitions the message out of the RetryImmediately state (self-clearing).
         message.ExpiresAt = DateTime.Now.AddHours(1);
         await storage.ChangeReceiveStateAsync(message, StatusName.Succeeded);
 

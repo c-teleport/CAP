@@ -109,6 +109,19 @@ public class SqlServerDataStorage : IDataStorage
         await connection.ExecuteNonQueryAsync(sql).ConfigureAwait(false);
     }
 
+    public async Task ChangeReceiveStateToRetryStartedAsync(MediumMessage message)
+    {
+        message.Added = DateTime.Now;
+        var sql = $"UPDATE {_recName} SET Added = @Added, StatusName = '{StatusName.Scheduled}' WHERE Id = @Id;";
+        var connection = new SqlConnection(_options.Value.ConnectionString);
+        await using var _ = connection.ConfigureAwait(false);
+        await connection.ExecuteNonQueryAsync(sql, sqlParams: new object[]
+        {
+            new SqlParameter("@Id", long.Parse(message.DbId)),
+            new SqlParameter("@Added", message.Added)
+        }).ConfigureAwait(false);
+    }
+
     public async Task ChangePublishStateAsync(MediumMessage message, StatusName state, object? transaction = null)
     {
         await ChangeMessageStateAsync(_pubName, message, state, transaction).ConfigureAwait(false);

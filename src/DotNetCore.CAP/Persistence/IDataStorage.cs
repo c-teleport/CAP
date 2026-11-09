@@ -28,6 +28,13 @@ public interface IDataStorage
     /// </summary>
     Task ChangeReceiveStateToImmediateRetryAsync(string[] ids);
 
+    /// <summary>
+    /// Marks a received message as handed to a retry run: status <see cref="StatusName.Scheduled"/> and
+    /// <c>Added</c> set to now, so the <c>FallbackWindowLookbackSeconds</c> window shields the running retry
+    /// from being dispatched again by the next polls. <c>Added</c> therefore means "last dispatched" for retried messages.
+    /// </summary>
+    Task ChangeReceiveStateToRetryStartedAsync(MediumMessage message);
+
     Task ChangePublishStateAsync(MediumMessage message, StatusName state, object? transaction = null);
 
     Task ChangeReceiveStateAsync(MediumMessage message, StatusName state);
