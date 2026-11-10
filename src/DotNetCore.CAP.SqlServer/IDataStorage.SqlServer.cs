@@ -103,7 +103,7 @@ public class SqlServerDataStorage : IDataStorage
 
     public async Task ChangeReceiveStateToImmediateRetryAsync(string[] ids)
     {
-        var sql = $"UPDATE {_recName} SET [StatusName]='{StatusName.RetryImmediately}' WHERE [Id] IN ({string.Join(',', ids)}) AND [StatusName]<>'{StatusName.Succeeded}';";
+        var sql = $"UPDATE {_recName} SET [StatusName]='{StatusName.RetryImmediately}',[LeasedUntil]=NULL WHERE [Id] IN ({string.Join(',', ids)}) AND [StatusName]<>'{StatusName.Succeeded}';";
         var connection = new SqlConnection(_options.Value.ConnectionString);
         await using var _ = connection.ConfigureAwait(false);
         await connection.ExecuteNonQueryAsync(sql).ConfigureAwait(false);
@@ -116,7 +116,48 @@ public class SqlServerDataStorage : IDataStorage
 
     public async Task ChangeReceiveStateAsync(MediumMessage message, StatusName state)
     {
-        await ChangeMessageStateAsync(_recName, message, state).ConfigureAwait(false);
+        var sql =
+            $"UPDATE {_recName} SET Content=@Content, Retries=@Retries,ExpiresAt=@ExpiresAt,StatusName=@StatusName,LeasedUntil=@LeasedUntil WHERE Id=@Id";
+
+        object[] sqlParams =
+        {
+            new SqlParameter("@Id", message.DbId),
+            new SqlParameter("@Content", _serializer.Serialize(message.Origin)),
+            new SqlParameter("@Retries", message.Retries),
+            new SqlParameter("@ExpiresAt", message.ExpiresAt),
+            new SqlParameter("@StatusName", state.ToString("G")),
+            new SqlParameter("@LeasedUntil", message.LeasedUntil.HasValue ? message.LeasedUntil.Value : DBNull.Value) { SqlDbType = SqlDbType.DateTime2 }
+        };
+
+        var connection = new SqlConnection(_options.Value.ConnectionString);
+        await using var _ = connection.ConfigureAwait(false);
+        await connection.ExecuteNonQueryAsync(sql, sqlParams: sqlParams).ConfigureAwait(false);
+    }
+
+    public async Task<bool> TryLeaseReceivedMessageAsync(MediumMessage message, TimeSpan lease)
+    {
+        var now = DateTime.Now;
+        var leasedUntil = now.Add(lease);
+        var sql =
+            $"UPDATE {_recName} SET StatusName = '{StatusName.Scheduled}', LeasedUntil = @LeasedUntil " +
+            "WHERE Id = @Id AND StatusName = @ExpectedStatus AND Retries = @ExpectedRetries AND (LeasedUntil IS NULL OR LeasedUntil < @Now);";
+
+        object[] sqlParams =
+        {
+            new SqlParameter("@Id", message.DbId),
+            new SqlParameter("@ExpectedStatus", message.StatusName.ToString("G")),
+            new SqlParameter("@ExpectedRetries", message.Retries),
+            new SqlParameter("@Now", now),
+            new SqlParameter("@LeasedUntil", leasedUntil)
+        };
+
+        var connection = new SqlConnection(_options.Value.ConnectionString);
+        await using var _ = connection.ConfigureAwait(false);
+        if (await connection.ExecuteNonQueryAsync(sql, sqlParams: sqlParams).ConfigureAwait(false) != 1) return false;
+
+        message.StatusName = StatusName.Scheduled;
+        message.LeasedUntil = leasedUntil;
+        return true;
     }
 
     public async Task<MediumMessage> StoreMessageAsync(string name, Message content, object? transaction = null)
@@ -350,22 +391,24 @@ public class SqlServerDataStorage : IDataStorage
     private async Task<IEnumerable<MediumMessage>> GetMessagesOfNeedRetryAsync(string tableName, TimeSpan lookbackSeconds,
         bool includeImmediateRetry = false)
     {
-        var fourMinAgo = DateTime.Now.Subtract(lookbackSeconds);
+        var now = DateTime.Now;
+        var fourMinAgo = now.Subtract(lookbackSeconds);
 
-        // Messages flagged for immediate retry on graceful shutdown bypass the lookback window.
-        var immediateRetryClause = includeImmediateRetry
-            ? $" OR StatusName = '{StatusName.RetryImmediately}'"
-            : string.Empty;
-
-        var sql =
-            $"SELECT TOP (200) Id, Content, Retries, Added FROM {tableName} WITH (READPAST) " +
-            $"WHERE Retries < @Retries AND Version = @Version AND ((Added < @Added AND StatusName IN ('{StatusName.Failed}', '{StatusName.Scheduled}')){immediateRetryClause});";
+        // Received rows: a message is eligible when its retry lease expired, or it never had one and is past the
+        // lookback window, or it was flagged for immediate retry on graceful shutdown. Published rows have no lease.
+        var sql = includeImmediateRetry
+            ? $"SELECT TOP (200) Id, Content, Retries, Added, StatusName, LeasedUntil FROM {tableName} WITH (READPAST) " +
+              $"WHERE Retries < @Retries AND Version = @Version AND ((StatusName IN ('{StatusName.Failed}', '{StatusName.Scheduled}') " +
+              $"AND ((LeasedUntil IS NULL AND Added < @Added) OR LeasedUntil < @Now)) OR StatusName = '{StatusName.RetryImmediately}');"
+            : $"SELECT TOP (200) Id, Content, Retries, Added, StatusName, NULL FROM {tableName} WITH (READPAST) " +
+              $"WHERE Retries < @Retries AND Version = @Version AND Added < @Added AND StatusName IN ('{StatusName.Failed}', '{StatusName.Scheduled}');";
 
         object[] sqlParams =
         {
             new SqlParameter("@Retries", _capOptions.Value.FailedRetryCount),
             new SqlParameter("@Version", _capOptions.Value.Version),
-            new SqlParameter("@Added", fourMinAgo)
+            new SqlParameter("@Added", fourMinAgo),
+            new SqlParameter("@Now", now)
         };
 
         var connection = new SqlConnection(_options.Value.ConnectionString);
@@ -380,7 +423,9 @@ public class SqlServerDataStorage : IDataStorage
                     DbId = reader.GetInt64(0).ToString(),
                     Origin = _serializer.Deserialize(reader.GetString(1))!,
                     Retries = reader.GetInt32(2),
-                    Added = reader.GetDateTime(3)
+                    Added = reader.GetDateTime(3),
+                    StatusName = Enum.Parse<StatusName>(reader.GetString(4)),
+                    LeasedUntil = reader.IsDBNull(5) ? null : reader.GetDateTime(5)
                 });
             }
 

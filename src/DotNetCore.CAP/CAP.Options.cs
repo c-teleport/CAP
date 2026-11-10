@@ -139,6 +139,11 @@ public class CapOptions
     /// <summary>
     /// Gets or sets the lookback time window (in seconds) for the retry processor to pick up scheduled or failed status messages.
     /// This ensures that messages with clocks slightly out of sync are still processed correctly.
+    /// It is also the lease a retry run holds on a received message: while the lease is valid no poll on any instance
+    /// dispatches that message again, and once it expires an unfinished run is treated as lost and retried.
+    /// The lease is taken per dispatch, survives the in-process attempts of that dispatch and ends with its final
+    /// Succeeded or Failed write. It starts when the message is handed to the dispatcher, so time spent waiting in
+    /// the parallel-execution buffer counts against it.
     /// Default is 240 seconds (4 minutes).
     /// </summary>
     public int FallbackWindowLookbackSeconds { get; set; }

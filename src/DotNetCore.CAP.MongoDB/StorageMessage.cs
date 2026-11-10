@@ -29,6 +29,9 @@ internal class ReceivedMessage
     public int Retries { get; set; }
 
     public string StatusName { get; set; } = default!;
+
+    [BsonDateTimeOptions(Kind = DateTimeKind.Local)]
+    public DateTime? LeasedUntil { get; set; }
 }
 
 internal class PublishedMessage

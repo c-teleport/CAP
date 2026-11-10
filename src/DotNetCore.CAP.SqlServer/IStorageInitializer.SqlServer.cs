@@ -81,18 +81,36 @@ CREATE TABLE {GetReceivedTableName()}(
 	[Added] [datetime2](7) NOT NULL,
     [ExpiresAt] [datetime2](7) NULL,
 	[StatusName] [nvarchar](50) NOT NULL,
+	[LeasedUntil] [datetime2](7) NULL,
  CONSTRAINT [PK_{GetReceivedTableName()}] PRIMARY KEY CLUSTERED
 (
 	[Id] ASC
 )WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON) ON [PRIMARY]
 ) ON [PRIMARY] TEXTIMAGE_ON [PRIMARY]
 
-CREATE NONCLUSTERED INDEX [IX_{GetReceivedTableName()}_Version_ExpiresAt_StatusName] ON {GetReceivedTableName()} ([Version] ASC,[ExpiresAt] ASC,[StatusName] ASC) 
-INCLUDE ([Id], [Content], [Retries], [Added])
+CREATE NONCLUSTERED INDEX [IX_{GetReceivedTableName()}_Version_StatusName_Added_LeasedUntil] ON {GetReceivedTableName()} ([Version] ASC,[StatusName] ASC,[Added] ASC,[LeasedUntil] ASC)
+INCLUDE ([Id], [Content], [Retries])
 
 CREATE NONCLUSTERED INDEX [IX_{GetReceivedTableName()}_ExpiresAt_StatusName] ON {GetReceivedTableName()} ([ExpiresAt] ASC,[StatusName] ASC)
 
 END;
+
+-- Instances starting together can both pass the guards; the loser's duplicate-column (2705), duplicate-index (1913)
+-- or already-dropped-index (3701) error is swallowed instead of failing startup.
+BEGIN TRY
+    IF COL_LENGTH(N'{GetReceivedTableName()}', 'LeasedUntil') IS NULL
+        ALTER TABLE {GetReceivedTableName()} ADD [LeasedUntil] [datetime2](7) NULL;
+
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_{GetReceivedTableName()}_Version_StatusName_Added_LeasedUntil' AND object_id = OBJECT_ID(N'{GetReceivedTableName()}'))
+        CREATE NONCLUSTERED INDEX [IX_{GetReceivedTableName()}_Version_StatusName_Added_LeasedUntil] ON {GetReceivedTableName()} ([Version] ASC,[StatusName] ASC,[Added] ASC,[LeasedUntil] ASC)
+        INCLUDE ([Id], [Content], [Retries]);
+
+    IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_{GetReceivedTableName()}_Version_ExpiresAt_StatusName' AND object_id = OBJECT_ID(N'{GetReceivedTableName()}'))
+        DROP INDEX [IX_{GetReceivedTableName()}_Version_ExpiresAt_StatusName] ON {GetReceivedTableName()};
+END TRY
+BEGIN CATCH
+    IF ERROR_NUMBER() NOT IN (2705, 1913, 3701) THROW;
+END CATCH;
 
 IF OBJECT_ID(N'{GetPublishedTableName()}',N'U') IS NULL
 BEGIN

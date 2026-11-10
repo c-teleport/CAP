@@ -126,6 +126,7 @@ internal class SubscribeExecutor : ISubscribeExecutor
     private Task SetSuccessfulState(MediumMessage message)
     {
         message.ExpiresAt = DateTime.Now.AddSeconds(_options.SucceedMessageExpiredAfter);
+        message.LeasedUntil = null;
 
         return _dataStorage.ChangeReceiveStateAsync(message, StatusName.Succeeded);
     }
@@ -139,6 +140,8 @@ internal class SubscribeExecutor : ISubscribeExecutor
 
         message.Origin.AddOrUpdateException(ex);
         message.ExpiresAt = message.Added.AddSeconds(_options.FailedMessageExpiredAfter);
+        // The lease covers the whole dispatch, including the in-process attempts that follow this write.
+        if (!needRetry) message.LeasedUntil = null;
 
         await _dataStorage.ChangeReceiveStateAsync(message, StatusName.Failed).ConfigureAwait(false);
 

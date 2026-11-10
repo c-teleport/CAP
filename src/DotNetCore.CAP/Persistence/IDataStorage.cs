@@ -28,6 +28,14 @@ public interface IDataStorage
     /// </summary>
     Task ChangeReceiveStateToImmediateRetryAsync(string[] ids);
 
+    /// <summary>
+    /// Grants the caller a lease on a received message about to be re-dispatched: the row is moved to
+    /// <see cref="StatusName.Scheduled"/> with <c>LeasedUntil = now + lease</c>, but only if its status is still
+    /// <see cref="MediumMessage.StatusName"/> and no other retry run holds a valid lease. Returns false when the row
+    /// changed underneath, in which case the caller must not dispatch it.
+    /// </summary>
+    Task<bool> TryLeaseReceivedMessageAsync(MediumMessage message, TimeSpan lease);
+
     Task ChangePublishStateAsync(MediumMessage message, StatusName state, object? transaction = null);
 
     Task ChangeReceiveStateAsync(MediumMessage message, StatusName state);

@@ -108,7 +108,9 @@ public class MongoDBDataStorage : IDataStorage
     public async Task ChangeReceiveStateToImmediateRetryAsync(string[] ids)
     {
         var collection = _database.GetCollection<ReceivedMessage>(_options.Value.ReceivedCollection);
-        var updateDef = Builders<ReceivedMessage>.Update.Set(x => x.StatusName, nameof(StatusName.RetryImmediately));
+        var updateDef = Builders<ReceivedMessage>.Update
+            .Set(x => x.StatusName, nameof(StatusName.RetryImmediately))
+            .Set(x => x.LeasedUntil, null);
         // A message may finish between being flagged and the host dying; never re-run a Succeeded one.
         var filter = Builders<ReceivedMessage>.Filter.In(x => x.Id, ids.Select(long.Parse))
                      & Builders<ReceivedMessage>.Filter.Ne(x => x.StatusName, nameof(StatusName.Succeeded));
@@ -146,9 +148,31 @@ public class MongoDBDataStorage : IDataStorage
             .Set(x => x.Content, _serializer.Serialize(message.Origin))
             .Set(x => x.Retries, message.Retries)
             .Set(x => x.ExpiresAt, message.ExpiresAt)
-            .Set(x => x.StatusName, state.ToString("G"));
+            .Set(x => x.StatusName, state.ToString("G"))
+            .Set(x => x.LeasedUntil, message.LeasedUntil);
 
         await collection.UpdateOneAsync(x => x.Id == long.Parse(message.DbId), updateDef).ConfigureAwait(false);
+    }
+
+    public async Task<bool> TryLeaseReceivedMessageAsync(MediumMessage message, TimeSpan lease)
+    {
+        var collection = _database.GetCollection<ReceivedMessage>(_options.Value.ReceivedCollection);
+        var id = long.Parse(message.DbId);
+        var now = DateTime.Now;
+        var expectedStatus = message.StatusName.ToString("G");
+        var expectedRetries = message.Retries;
+        var leasedUntil = now.Add(lease);
+
+        var result = await collection.UpdateOneAsync(
+            x => x.Id == id && x.StatusName == expectedStatus && x.Retries == expectedRetries && (x.LeasedUntil == null || x.LeasedUntil < now),
+            Builders<ReceivedMessage>.Update
+                .Set(x => x.StatusName, nameof(StatusName.Scheduled))
+                .Set(x => x.LeasedUntil, leasedUntil)).ConfigureAwait(false);
+        if (result.ModifiedCount != 1) return false;
+
+        message.StatusName = StatusName.Scheduled;
+        message.LeasedUntil = leasedUntil;
+        return true;
     }
 
     public async Task<MediumMessage> StoreMessageAsync(string name, Message content, object? dbTransaction = null)
@@ -292,13 +316,13 @@ public class MongoDBDataStorage : IDataStorage
 
     public async Task<IEnumerable<MediumMessage>> GetReceivedMessagesOfNeedRetry(TimeSpan lookbackSeconds)
     {
-        var fourMinAgo = DateTime.Now.Subtract(lookbackSeconds);
+        var now = DateTime.Now;
+        var fourMinAgo = now.Subtract(lookbackSeconds);
         var collection = _database.GetCollection<ReceivedMessage>(_options.Value.ReceivedCollection);
         var queryResult = await collection
             .Find(x => x.Retries < _capOptions.Value.FailedRetryCount
-                       && ((x.Added < fourMinAgo
-                            && (x.StatusName == nameof(StatusName.Failed) ||
-                                x.StatusName == nameof(StatusName.Scheduled)))
+                       && (((x.StatusName == nameof(StatusName.Failed) || x.StatusName == nameof(StatusName.Scheduled))
+                            && ((x.LeasedUntil == null && x.Added < fourMinAgo) || x.LeasedUntil < now))
                            || x.StatusName == nameof(StatusName.RetryImmediately)))
             .SortBy(x => x.Added)
             .Limit(200)
@@ -308,7 +332,9 @@ public class MongoDBDataStorage : IDataStorage
             DbId = x.Id.ToString(),
             Origin = _serializer.Deserialize(x.Content)!,
             Retries = x.Retries,
-            Added = x.Added
+            Added = x.Added,
+            StatusName = Enum.Parse<StatusName>(x.StatusName),
+            LeasedUntil = x.LeasedUntil
         }).ToList();
     }
 
