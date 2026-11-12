@@ -152,8 +152,10 @@ public class MongoDBDataStorage : IDataStorage
             .Set(x => x.LeasedUntil, message.LeasedUntil);
 
         var filter = Builders<ReceivedMessage>.Filter.Eq(x => x.Id, long.Parse(message.DbId));
+        // A row this run still owns may have been flagged RetryImmediately on shutdown, which clears its lease.
         if (message.HeldLease is { } held)
-            filter &= Builders<ReceivedMessage>.Filter.Eq(x => x.LeasedUntil, held);
+            filter &= Builders<ReceivedMessage>.Filter.Where(x =>
+                x.LeasedUntil == held || (x.LeasedUntil == null && x.StatusName == nameof(StatusName.RetryImmediately)));
 
         var result = await collection.UpdateOneAsync(filter, updateDef).ConfigureAwait(false);
         if (result.MatchedCount != 1) return false;

@@ -124,6 +124,34 @@ public class ReceivedMessageLeaseStorageTests
     }
 
     [Fact]
+    public async Task ChangeReceiveState_Applies_ForTheOwner_AfterItsRowWasFlaggedOnShutdown()
+    {
+        var storage = CreateStorage();
+        var message = await storage.StoreReceivedMessageAsync("test.topic", "group", CreateMessage());
+        await storage.ChangeReceiveStateToImmediateRetryAsync(new[] { message.DbId });
+
+        message.ExpiresAt = DateTime.Now.AddHours(1);
+        message.LeasedUntil = null;
+        (await storage.ChangeReceiveStateAsync(message, StatusName.Succeeded)).Should().BeTrue();
+
+        (await storage.GetReceivedMessagesOfNeedRetry(TimeSpan.Zero)).Select(m => m.DbId).Should().NotContain(message.DbId);
+    }
+
+    [Fact]
+    public async Task ChangeReceiveState_IsFencedOut_WhenAFlaggedRowWasAlreadyTakenByAnotherRun()
+    {
+        var storage = CreateStorage();
+        var message = await storage.StoreReceivedMessageAsync("test.topic", "group", CreateMessage());
+        await storage.ChangeReceiveStateToImmediateRetryAsync(new[] { message.DbId });
+        var taken = (await storage.GetReceivedMessagesOfNeedRetry(Lookback)).Single(m => m.DbId == message.DbId);
+        (await storage.TryLeaseReceivedMessageAsync(taken, Lease)).Should().BeTrue();
+
+        message.ExpiresAt = DateTime.Now.AddHours(1);
+        message.LeasedUntil = null;
+        (await storage.ChangeReceiveStateAsync(message, StatusName.Succeeded)).Should().BeFalse();
+    }
+
+    [Fact]
     public async Task ChangeReceiveState_Applies_WhenTheRunHoldsNoLease()
     {
         var storage = CreateStorage();

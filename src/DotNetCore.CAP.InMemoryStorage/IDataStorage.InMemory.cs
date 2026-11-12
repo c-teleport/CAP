@@ -137,7 +137,10 @@ internal class InMemoryStorage : IDataStorage
         var stored = ReceivedMessages[message.DbId];
         lock (stored)
         {
-            if (message.HeldLease is { } held && stored.LeasedUntil != held) return Task.FromResult(false);
+            // A row this run still owns may have been flagged RetryImmediately on shutdown, which clears its lease.
+            if (message.HeldLease is { } held && stored.LeasedUntil != held
+                && !(stored.LeasedUntil == null && stored.StatusName == StatusName.RetryImmediately))
+                return Task.FromResult(false);
 
             stored.StatusName = state;
             stored.ExpiresAt = message.ExpiresAt;

@@ -121,9 +121,10 @@ public class MySqlDataStorage : IDataStorage
     public async Task<bool> ChangeReceiveStateAsync(MediumMessage message, StatusName state)
     {
         var held = message.HeldLease;
+        // A row this run still owns may have been flagged RetryImmediately on shutdown, which clears its lease.
         var sql =
             $"UPDATE `{_recName}` SET `Content`=@Content,`Retries`=@Retries,`ExpiresAt`=@ExpiresAt,`StatusName`=@StatusName,`LeasedUntil`=@LeasedUntil WHERE `Id`=@Id" +
-            (held.HasValue ? " AND `LeasedUntil`=@HeldLease;" : ";");
+            (held.HasValue ? $" AND (`LeasedUntil`=@HeldLease OR (`LeasedUntil` IS NULL AND `StatusName`='{StatusName.RetryImmediately}'));" : ";");
 
         var sqlParams = new List<object>
         {

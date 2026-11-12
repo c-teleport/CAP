@@ -202,9 +202,22 @@ internal class SubscribeExecutor : ISubscribeExecutor
     private async Task SetSuccessfulState(MediumMessage message)
     {
         message.ExpiresAt = DateTime.Now.AddSeconds(_options.SucceedMessageExpiredAfter);
+        var lease = message.LeasedUntil;
         message.LeasedUntil = null;
 
-        if (!await _dataStorage.ChangeReceiveStateAsync(message, StatusName.Succeeded).ConfigureAwait(false))
+        bool written;
+        try
+        {
+            written = await _dataStorage.ChangeReceiveStateAsync(message, StatusName.Succeeded).ConfigureAwait(false);
+        }
+        catch
+        {
+            // The failure path that follows still runs under the lease.
+            message.LeasedUntil = lease;
+            throw;
+        }
+
+        if (!written)
             _logger.LogWarning("Received message {MessageId} succeeded, but its lease was taken over before the result was written; the new owner's result stands.", message.DbId);
     }
 

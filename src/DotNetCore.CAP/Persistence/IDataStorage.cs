@@ -47,7 +47,8 @@ public interface IDataStorage
 
     /// <summary>
     /// Writes the message's state, retries, content and <see cref="MediumMessage.LeasedUntil"/>. When the message holds
-    /// a lease (<see cref="MediumMessage.HeldLease"/>) the write only applies while the row still carries that lease;
+    /// a lease (<see cref="MediumMessage.HeldLease"/>) the write only applies while the row still carries that lease,
+    /// or was flagged <c>RetryImmediately</c> on shutdown and not yet taken by another run;
     /// returns false when another run took the row over and nothing was written.
     /// </summary>
     Task<bool> ChangeReceiveStateAsync(MediumMessage message, StatusName state);

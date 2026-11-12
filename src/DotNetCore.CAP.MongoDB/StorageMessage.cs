@@ -8,6 +8,8 @@ using MongoDB.Bson.Serialization.IdGenerators;
 
 namespace DotNetCore.CAP.MongoDB;
 
+// Lets an older version keep reading documents once a newer one adds a field.
+[BsonIgnoreExtraElements]
 internal class ReceivedMessage
 {
     public long Id { get; set; }
@@ -34,6 +36,7 @@ internal class ReceivedMessage
     public DateTime? LeasedUntil { get; set; }
 }
 
+[BsonIgnoreExtraElements]
 internal class PublishedMessage
 {
     public long Id { get; set; }

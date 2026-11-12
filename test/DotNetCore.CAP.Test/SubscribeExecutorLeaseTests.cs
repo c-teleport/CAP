@@ -205,6 +205,19 @@ public class SubscribeExecutorLeaseTests
         _writes.Should().ContainSingle().Which.State.Should().Be(StatusName.Succeeded);
     }
 
+    [Fact]
+    public async Task ExecuteAsync_KeepsTheLease_WhenTheSucceededWriteThrows()
+    {
+        _invoker.InvokeAsync(Arg.Any<ConsumerContext>(), Arg.Any<CancellationToken>()).Returns(new ConsumerExecutedResult(null, "1", null, null));
+        _storage.ChangeReceiveStateAsync(Arg.Any<MediumMessage>(), StatusName.Succeeded).ThrowsAsync(new TimeoutException());
+        var executor = CreateExecutor(failedRetryCount: 5);
+
+        await executor.ExecuteAsync(CreateLeasedMessage(), CreateDescriptor(), CancellationToken.None);
+
+        _writes.First().State.Should().Be(StatusName.Failed);
+        _writes.First().LeasedUntil.Should().NotBeNull();
+    }
+
     private int Renewals() => _storage.ReceivedCalls().Count(c => c.GetMethodInfo().Name == nameof(IDataStorage.TryRenewReceivedMessageLeaseAsync));
 
     private ISubscribeExecutor CreateExecutor(int failedRetryCount, int leaseSeconds = 60)
