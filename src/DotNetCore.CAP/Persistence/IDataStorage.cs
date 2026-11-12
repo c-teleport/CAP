@@ -36,9 +36,21 @@ public interface IDataStorage
     /// </summary>
     Task<bool> TryLeaseReceivedMessageAsync(MediumMessage message, TimeSpan lease);
 
+    /// <summary>
+    /// Extends the lease the caller holds on a received message to <c>now + lease</c>. Fenced on the current
+    /// <see cref="MediumMessage.LeasedUntil"/>: returns false when the row's lease differs, meaning it expired and
+    /// was taken by another run or was released by a final write.
+    /// </summary>
+    Task<bool> TryRenewReceivedMessageLeaseAsync(MediumMessage message, TimeSpan lease);
+
     Task ChangePublishStateAsync(MediumMessage message, StatusName state, object? transaction = null);
 
-    Task ChangeReceiveStateAsync(MediumMessage message, StatusName state);
+    /// <summary>
+    /// Writes the message's state, retries, content and <see cref="MediumMessage.LeasedUntil"/>. When the message holds
+    /// a lease (<see cref="MediumMessage.HeldLease"/>) the write only applies while the row still carries that lease;
+    /// returns false when another run took the row over and nothing was written.
+    /// </summary>
+    Task<bool> ChangeReceiveStateAsync(MediumMessage message, StatusName state);
 
     Task<MediumMessage> StoreMessageAsync(string name, Message content, object? transaction = null);
 

@@ -86,13 +86,10 @@ BEGIN
         EXCEPTION WHEN duplicate_column THEN NULL;
         END;
     END IF;
-    BEGIN
-        CREATE INDEX IF NOT EXISTS ""idx_received_StatusName_Added_LeasedUntil"" ON {GetReceivedTableName()} (""StatusName"",""Added"",""LeasedUntil"");
-    EXCEPTION WHEN duplicate_table THEN NULL;
-    END;
 END $$;
 CREATE INDEX IF NOT EXISTS ""idx_received_StatusName_ExpiresAt"" ON {GetReceivedTableName()} (""StatusName"",""ExpiresAt"");
-DROP INDEX IF EXISTS ""{schema}"".""idx_received_StatusName_Added"";
+CREATE INDEX IF NOT EXISTS ""idx_received_StatusName_Added"" ON {GetReceivedTableName()} (""StatusName"",""Added"");
+DROP INDEX IF EXISTS ""{schema}"".""idx_received_StatusName_Added_LeasedUntil"";
 DROP INDEX IF EXISTS ""idx_received_ExpiresAt_StatusName"";
 DROP INDEX IF EXISTS ""idx_received_Version_ExpiresAt_StatusName"";
 

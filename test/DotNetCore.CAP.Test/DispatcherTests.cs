@@ -408,6 +408,50 @@ public class DispatcherTests
     }
 
     [Fact]
+    public async Task DrainReceivedAsync_DoesNotFlag_MessagesWhoseLeaseExpired()
+    {
+        var firstCallStarted = new TaskCompletionSource();
+        var blocker = new TaskCompletionSource<OperateResult>();
+        _executor.ExecuteAsync(Arg.Any<MediumMessage>(), Arg.Any<ConsumerExecutorDescriptor>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                firstCallStarted.TrySetResult();
+                return blocker.Task;
+            });
+
+        var options = Options.Create(new CapOptions
+        {
+            EnableSubscriberParallelExecute = true,
+            EnableImmediateRetryOnShutdown = true,
+            SubscriberParallelExecuteThreadCount = 1,
+            SubscriberParallelExecuteBufferFactor = 100
+        });
+        var dispatcher = new Dispatcher(_logger, new TestThreadSafeMessageSender(), options, _executor, _storage);
+        using var cts = new CancellationTokenSource();
+        await dispatcher.StartAsync(cts.Token);
+
+        var inFlightExpired = CreateTestMessage("1");
+        inFlightExpired.LeasedUntil = DateTime.Now.AddSeconds(-1);
+        var bufferedValid = CreateTestMessage("2");
+        bufferedValid.LeasedUntil = DateTime.Now.AddMinutes(1);
+        var bufferedExpired = CreateTestMessage("3");
+        bufferedExpired.LeasedUntil = DateTime.Now.AddSeconds(-1);
+
+        await dispatcher.EnqueueToExecute(inFlightExpired);
+        await firstCallStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await dispatcher.EnqueueToExecute(bufferedValid);
+        await dispatcher.EnqueueToExecute(bufferedExpired);
+
+        await dispatcher.DrainReceivedAsync(TimeSpan.FromMilliseconds(300));
+
+        await _storage.Received(1)
+            .ChangeReceiveStateToImmediateRetryAsync(Arg.Is<string[]>(ids => ids.Length == 1 && ids[0] == "2"));
+
+        blocker.TrySetResult(OperateResult.Success);
+        await cts.CancelAsync();
+    }
+
+    [Fact]
     public async Task DrainReceivedAsync_DoesNotFlag_WhenImmediateRetryDisabled()
     {
         // Arrange

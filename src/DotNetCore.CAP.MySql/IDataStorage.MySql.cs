@@ -118,12 +118,14 @@ public class MySqlDataStorage : IDataStorage
         await ChangeMessageStateAsync(_pubName, message, state, transaction).ConfigureAwait(false);
     }
 
-    public async Task ChangeReceiveStateAsync(MediumMessage message, StatusName state)
+    public async Task<bool> ChangeReceiveStateAsync(MediumMessage message, StatusName state)
     {
+        var held = message.HeldLease;
         var sql =
-            $"UPDATE `{_recName}` SET `Content`=@Content,`Retries`=@Retries,`ExpiresAt`=@ExpiresAt,`StatusName`=@StatusName,`LeasedUntil`=@LeasedUntil WHERE `Id`=@Id;";
+            $"UPDATE `{_recName}` SET `Content`=@Content,`Retries`=@Retries,`ExpiresAt`=@ExpiresAt,`StatusName`=@StatusName,`LeasedUntil`=@LeasedUntil WHERE `Id`=@Id" +
+            (held.HasValue ? " AND `LeasedUntil`=@HeldLease;" : ";");
 
-        object[] sqlParams =
+        var sqlParams = new List<object>
         {
             new MySqlParameter("@Id", message.DbId),
             new MySqlParameter("@Content", _serializer.Serialize(message.Origin)),
@@ -132,16 +134,23 @@ public class MySqlDataStorage : IDataStorage
             new MySqlParameter("@StatusName", state.ToString("G")),
             new MySqlParameter("@LeasedUntil", message.LeasedUntil)
         };
+        if (held.HasValue) sqlParams.Add(new MySqlParameter("@HeldLease", held.Value));
 
         await using var connection = new MySqlConnection(_options.Value.ConnectionString);
         await using var _ = connection.ConfigureAwait(false);
-        await connection.ExecuteNonQueryAsync(sql, sqlParams: sqlParams).ConfigureAwait(false);
+        if (await connection.ExecuteNonQueryAsync(sql, sqlParams: sqlParams.ToArray()).ConfigureAwait(false) != 1) return false;
+
+        message.HeldLease = message.LeasedUntil;
+        return true;
     }
+
+    // `LeasedUntil` is a datetime(0): the lease must be stored at whole seconds or the fenced renewal never matches.
+    private static DateTime WholeSeconds(DateTime value) => new(value.Ticks - value.Ticks % TimeSpan.TicksPerSecond, value.Kind);
 
     public async Task<bool> TryLeaseReceivedMessageAsync(MediumMessage message, TimeSpan lease)
     {
         var now = DateTime.Now;
-        var leasedUntil = now.Add(lease);
+        var leasedUntil = WholeSeconds(now.Add(lease));
         var sql =
             $"UPDATE `{_recName}` SET `StatusName`='{StatusName.Scheduled}',`LeasedUntil`=@LeasedUntil " +
             "WHERE `Id`=@Id AND `StatusName`=@ExpectedStatus AND `Retries`=@ExpectedRetries AND (`LeasedUntil` IS NULL OR `LeasedUntil`<@Now);";
@@ -161,6 +170,30 @@ public class MySqlDataStorage : IDataStorage
 
         message.StatusName = StatusName.Scheduled;
         message.LeasedUntil = leasedUntil;
+        message.HeldLease = leasedUntil;
+        return true;
+    }
+
+    public async Task<bool> TryRenewReceivedMessageLeaseAsync(MediumMessage message, TimeSpan lease)
+    {
+        if (message.LeasedUntil is not { } current) return false;
+
+        var leasedUntil = WholeSeconds(DateTime.Now.Add(lease));
+        var sql = $"UPDATE `{_recName}` SET `LeasedUntil`=@LeasedUntil WHERE `Id`=@Id AND `LeasedUntil`=@Current;";
+
+        object[] sqlParams =
+        {
+            new MySqlParameter("@Id", message.DbId),
+            new MySqlParameter("@Current", current),
+            new MySqlParameter("@LeasedUntil", leasedUntil)
+        };
+
+        var connection = new MySqlConnection(_options.Value.ConnectionString);
+        await using var _ = connection.ConfigureAwait(false);
+        if (await connection.ExecuteNonQueryAsync(sql, sqlParams: sqlParams).ConfigureAwait(false) != 1) return false;
+
+        message.LeasedUntil = leasedUntil;
+        message.HeldLease = leasedUntil;
         return true;
     }
 
@@ -221,7 +254,8 @@ public class MySqlDataStorage : IDataStorage
             new MySqlParameter("@Retries", _capOptions.Value.FailedRetryCount),
             new MySqlParameter("@Added", DateTime.Now),
             new MySqlParameter("@ExpiresAt", DateTime.Now.AddSeconds(_capOptions.Value.FailedMessageExpiredAfter)),
-            new MySqlParameter("@StatusName", nameof(StatusName.Failed))
+            new MySqlParameter("@StatusName", nameof(StatusName.Failed)),
+            new MySqlParameter("@LeasedUntil", DBNull.Value)
         };
 
         await StoreReceivedMessage(sqlParams).ConfigureAwait(false);
@@ -235,8 +269,11 @@ public class MySqlDataStorage : IDataStorage
             Origin = message,
             Added = DateTime.Now,
             ExpiresAt = null,
-            Retries = 0
+            Retries = 0,
+            StatusName = StatusName.Scheduled
         };
+        mdMessage.LeasedUntil = WholeSeconds(mdMessage.Added.AddSeconds(_capOptions.Value.ReceivedMessageLeaseSeconds));
+        mdMessage.HeldLease = mdMessage.LeasedUntil;
 
         object[] sqlParams =
         {
@@ -247,7 +284,8 @@ public class MySqlDataStorage : IDataStorage
             new MySqlParameter("@Retries", mdMessage.Retries),
             new MySqlParameter("@Added", mdMessage.Added),
             new MySqlParameter("@ExpiresAt", mdMessage.ExpiresAt.HasValue ? mdMessage.ExpiresAt.Value : DBNull.Value),
-            new MySqlParameter("@StatusName", nameof(StatusName.Scheduled))
+            new MySqlParameter("@StatusName", nameof(StatusName.Scheduled)),
+            new MySqlParameter("@LeasedUntil", mdMessage.LeasedUntil!.Value)
         };
 
         await StoreReceivedMessage(sqlParams).ConfigureAwait(false);
@@ -386,8 +424,8 @@ public class MySqlDataStorage : IDataStorage
     private async Task StoreReceivedMessage(object[] sqlParams)
     {
         var sql =
-            $@"INSERT INTO `{_recName}`(`Id`,`Version`,`Name`,`Group`,`Content`,`Retries`,`Added`,`ExpiresAt`,`StatusName`) " +
-            $"VALUES(@Id,'{_options.Value.Version}',@Name,@Group,@Content,@Retries,@Added,@ExpiresAt,@StatusName);";
+            $@"INSERT INTO `{_recName}`(`Id`,`Version`,`Name`,`Group`,`Content`,`Retries`,`Added`,`ExpiresAt`,`StatusName`,`LeasedUntil`) " +
+            $"VALUES(@Id,'{_options.Value.Version}',@Name,@Group,@Content,@Retries,@Added,@ExpiresAt,@StatusName,@LeasedUntil);";
 
         var connection = new MySqlConnection(_options.Value.ConnectionString);
         await using var _ = connection.ConfigureAwait(false);
@@ -399,12 +437,13 @@ public class MySqlDataStorage : IDataStorage
     {
         var now = DateTime.Now;
         var fourMinAgo = now.Subtract(lookbackSeconds);
+        var leaseBound = now.AddSeconds(-_capOptions.Value.ReceivedMessageLeaseSeconds);
 
         // Received rows: a message is eligible when its retry lease expired, or it never had one and is past the
         // lookback window, or it was flagged for immediate retry on graceful shutdown. Published rows have no lease.
         var sql = includeImmediateRetry
             ? $"SELECT `Id`,`Content`,`Retries`,`Added`,`StatusName`,`LeasedUntil` FROM `{tableName}` WHERE `Retries`<@Retries AND `Version`=@Version " +
-              $"AND ((`StatusName` IN ('{StatusName.Failed}','{StatusName.Scheduled}') AND ((`LeasedUntil` IS NULL AND `Added`<@Added) OR `LeasedUntil`<@Now)) " +
+              $"AND ((`StatusName` IN ('{StatusName.Failed}','{StatusName.Scheduled}') AND `Added`<@AddedBound AND ((`LeasedUntil` IS NULL AND `Added`<@Added) OR (`LeasedUntil`<@Now AND `Added`<@LeaseAdded))) " +
               $"OR `StatusName`='{StatusName.RetryImmediately}') LIMIT 200;"
             : $"SELECT `Id`,`Content`,`Retries`,`Added`,`StatusName`,NULL FROM `{tableName}` WHERE `Retries`<@Retries AND `Version`=@Version " +
               $"AND `Added`<@Added AND `StatusName` IN ('{StatusName.Failed}','{StatusName.Scheduled}') LIMIT 200;";
@@ -414,7 +453,11 @@ public class MySqlDataStorage : IDataStorage
             new MySqlParameter("@Retries", _capOptions.Value.FailedRetryCount),
             new MySqlParameter("@Version", _capOptions.Value.Version),
             new MySqlParameter("@Added", fourMinAgo),
-            new MySqlParameter("@Now", now)
+            new MySqlParameter("@Now", now),
+            // An expired lease implies Added < now - lease. @AddedBound repeats the later of the two bounds outside the OR,
+            // where the planner can use it to skip rows that were only just stored.
+            new MySqlParameter("@LeaseAdded", leaseBound),
+            new MySqlParameter("@AddedBound", leaseBound > fourMinAgo ? leaseBound : fourMinAgo)
         };
 
         var connection = new MySqlConnection(_options.Value.ConnectionString);

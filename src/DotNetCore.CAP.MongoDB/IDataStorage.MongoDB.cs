@@ -140,7 +140,7 @@ public class MongoDBDataStorage : IDataStorage
         }
     }
 
-    public async Task ChangeReceiveStateAsync(MediumMessage message, StatusName state)
+    public async Task<bool> ChangeReceiveStateAsync(MediumMessage message, StatusName state)
     {
         var collection = _database.GetCollection<ReceivedMessage>(_options.Value.ReceivedCollection);
 
@@ -151,7 +151,15 @@ public class MongoDBDataStorage : IDataStorage
             .Set(x => x.StatusName, state.ToString("G"))
             .Set(x => x.LeasedUntil, message.LeasedUntil);
 
-        await collection.UpdateOneAsync(x => x.Id == long.Parse(message.DbId), updateDef).ConfigureAwait(false);
+        var filter = Builders<ReceivedMessage>.Filter.Eq(x => x.Id, long.Parse(message.DbId));
+        if (message.HeldLease is { } held)
+            filter &= Builders<ReceivedMessage>.Filter.Eq(x => x.LeasedUntil, held);
+
+        var result = await collection.UpdateOneAsync(filter, updateDef).ConfigureAwait(false);
+        if (result.MatchedCount != 1) return false;
+
+        message.HeldLease = message.LeasedUntil;
+        return true;
     }
 
     public async Task<bool> TryLeaseReceivedMessageAsync(MediumMessage message, TimeSpan lease)
@@ -172,6 +180,25 @@ public class MongoDBDataStorage : IDataStorage
 
         message.StatusName = StatusName.Scheduled;
         message.LeasedUntil = leasedUntil;
+        message.HeldLease = leasedUntil;
+        return true;
+    }
+
+    public async Task<bool> TryRenewReceivedMessageLeaseAsync(MediumMessage message, TimeSpan lease)
+    {
+        if (message.LeasedUntil is not { } current) return false;
+
+        var collection = _database.GetCollection<ReceivedMessage>(_options.Value.ReceivedCollection);
+        var id = long.Parse(message.DbId);
+        var leasedUntil = DateTime.Now.Add(lease);
+
+        var result = await collection.UpdateOneAsync(
+            x => x.Id == id && x.LeasedUntil == current,
+            Builders<ReceivedMessage>.Update.Set(x => x.LeasedUntil, leasedUntil)).ConfigureAwait(false);
+        if (result.MatchedCount != 1) return false;
+
+        message.LeasedUntil = leasedUntil;
+        message.HeldLease = leasedUntil;
         return true;
     }
 
@@ -244,8 +271,11 @@ public class MongoDBDataStorage : IDataStorage
             Origin = message,
             Added = DateTime.Now,
             ExpiresAt = null,
-            Retries = 0
+            Retries = 0,
+            StatusName = StatusName.Scheduled
         };
+        mdMessage.LeasedUntil = mdMessage.Added.AddSeconds(_capOptions.Value.ReceivedMessageLeaseSeconds);
+        mdMessage.HeldLease = mdMessage.LeasedUntil;
         var content = _serializer.Serialize(mdMessage.Origin);
 
         var collection = _database.GetCollection<ReceivedMessage>(_options.Value.ReceivedCollection);
@@ -260,7 +290,8 @@ public class MongoDBDataStorage : IDataStorage
             ExpiresAt = mdMessage.ExpiresAt,
             Retries = mdMessage.Retries,
             Version = _capOptions.Value.Version,
-            StatusName = nameof(StatusName.Scheduled)
+            StatusName = nameof(StatusName.Scheduled),
+            LeasedUntil = mdMessage.LeasedUntil
         };
 
         await collection.InsertOneAsync(store).ConfigureAwait(false);
@@ -319,11 +350,20 @@ public class MongoDBDataStorage : IDataStorage
         var now = DateTime.Now;
         var fourMinAgo = now.Subtract(lookbackSeconds);
         var collection = _database.GetCollection<ReceivedMessage>(_options.Value.ReceivedCollection);
-        var queryResult = await collection
-            .Find(x => x.Retries < _capOptions.Value.FailedRetryCount
+        // An expired lease implies Added < now - lease. addedBound repeats the later of the two bounds outside the OR,
+        // where the planner can use it to skip rows that were only just stored.
+        var leaseBound = now.AddSeconds(-_capOptions.Value.ReceivedMessageLeaseSeconds);
+        var addedBound = leaseBound > fourMinAgo ? leaseBound : fourMinAgo;
+        // The top-level status list is redundant; it lets the planner merge-sort on Added instead of sorting in memory.
+        var unfinished = Builders<ReceivedMessage>.Filter.In(x => x.StatusName,
+            new[] { nameof(StatusName.Failed), nameof(StatusName.Scheduled), nameof(StatusName.RetryImmediately) });
+        var eligible = Builders<ReceivedMessage>.Filter.Where(x => x.Retries < _capOptions.Value.FailedRetryCount
                        && (((x.StatusName == nameof(StatusName.Failed) || x.StatusName == nameof(StatusName.Scheduled))
-                            && ((x.LeasedUntil == null && x.Added < fourMinAgo) || x.LeasedUntil < now))
-                           || x.StatusName == nameof(StatusName.RetryImmediately)))
+                            && x.Added < addedBound
+                            && ((x.LeasedUntil == null && x.Added < fourMinAgo) || (x.LeasedUntil < now && x.Added < leaseBound)))
+                           || x.StatusName == nameof(StatusName.RetryImmediately)));
+        var queryResult = await collection
+            .Find(unfinished & eligible)
             .SortBy(x => x.Added)
             .Limit(200)
             .ToListAsync().ConfigureAwait(false);

@@ -28,6 +28,8 @@ internal class SubscribeExecutor : ISubscribeExecutor
     private readonly ILogger _logger;
     private readonly CapOptions _options;
     private readonly IServiceProvider _provider;
+    private readonly TimeSpan _lease;
+    private readonly TimeSpan _leaseHeartbeat;
 
     public SubscribeExecutor(
         ILogger<SubscribeExecutor> logger,
@@ -37,6 +39,8 @@ internal class SubscribeExecutor : ISubscribeExecutor
         _provider = provider;
         _logger = logger;
         _options = options.Value;
+        _lease = TimeSpan.FromSeconds(_options.ReceivedMessageLeaseSeconds);
+        _leaseHeartbeat = TimeSpan.FromSeconds(Math.Max(1, _options.ReceivedMessageLeaseSeconds / 3.0));
 
         _dataStorage = _provider.GetRequiredService<IDataStorage>();
         Invoker = _provider.GetRequiredService<ISubscribeInvoker>();
@@ -82,12 +86,84 @@ internal class SubscribeExecutor : ISubscribeExecutor
         return result;
     }
 
+    // Time in the execution buffer and earlier in-process attempts are not covered by the heartbeat.
+    private async Task<bool> EnsureLeaseAsync(MediumMessage message)
+    {
+        if (message.LeasedUntil is not { } leasedUntil || leasedUntil - DateTime.Now > _lease - _leaseHeartbeat) return true;
+
+        try
+        {
+            return await _dataStorage.TryRenewReceivedMessageLeaseAsync(message, _lease).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Renewing the lease on received message {MessageId} failed.", message.DbId);
+            return leasedUntil > DateTime.Now;
+        }
+    }
+
+    // The heartbeat is stopped and awaited before the caller writes the result, so a renewal cannot fence that write out.
+    private async Task InvokeWithLeaseHeartbeatAsync(MediumMessage message, ConsumerExecutorDescriptor descriptor,
+        CancellationToken cancellationToken)
+    {
+        if (message.LeasedUntil == null)
+        {
+            await InvokeConsumerMethodAsync(message, descriptor, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        using var heartbeatCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var heartbeat = RenewLeaseAsync(message, heartbeatCts.Token);
+        try
+        {
+            await InvokeConsumerMethodAsync(message, descriptor, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            heartbeatCts.Cancel();
+            await heartbeat.ConfigureAwait(false);
+        }
+    }
+
+    private async Task RenewLeaseAsync(MediumMessage message, CancellationToken token)
+    {
+        while (true)
+        {
+            try
+            {
+                await Task.Delay(_leaseHeartbeat, token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+
+            try
+            {
+                if (await _dataStorage.TryRenewReceivedMessageLeaseAsync(message, _lease).ConfigureAwait(false)) continue;
+
+                _logger.LogWarning("The lease on received message {MessageId} was lost; another instance may run it again.", message.DbId);
+                return;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Renewing the lease on received message {MessageId} failed.", message.DbId);
+            }
+        }
+    }
+
     private async Task<(bool, OperateResult)> ExecuteWithoutRetryAsync(MediumMessage message,
         ConsumerExecutorDescriptor descriptor, CancellationToken cancellationToken)
     {
         if (message == null) throw new ArgumentNullException(nameof(message));
 
         cancellationToken.ThrowIfCancellationRequested();
+
+        if (!await EnsureLeaseAsync(message).ConfigureAwait(false))
+        {
+            _logger.LogWarning("Received message {MessageId} was not executed: its lease expired before it could run and it is left to the retry processor.", message.DbId);
+            return (false, OperateResult.Failed(new InvalidOperationException($"The lease on received message {message.DbId} was lost before execution.")));
+        }
 
         try
         {
@@ -96,7 +172,7 @@ internal class SubscribeExecutor : ISubscribeExecutor
 
             var sp = Stopwatch.StartNew();
 
-            await InvokeConsumerMethodAsync(message, descriptor, cancellationToken).ConfigureAwait(false);
+            await InvokeWithLeaseHeartbeatAsync(message, descriptor, cancellationToken).ConfigureAwait(false);
 
             sp.Stop();
 
@@ -123,12 +199,13 @@ internal class SubscribeExecutor : ISubscribeExecutor
         }
     }
 
-    private Task SetSuccessfulState(MediumMessage message)
+    private async Task SetSuccessfulState(MediumMessage message)
     {
         message.ExpiresAt = DateTime.Now.AddSeconds(_options.SucceedMessageExpiredAfter);
         message.LeasedUntil = null;
 
-        return _dataStorage.ChangeReceiveStateAsync(message, StatusName.Succeeded);
+        if (!await _dataStorage.ChangeReceiveStateAsync(message, StatusName.Succeeded).ConfigureAwait(false))
+            _logger.LogWarning("Received message {MessageId} succeeded, but its lease was taken over before the result was written; the new owner's result stands.", message.DbId);
     }
 
     private async Task<bool> SetFailedState(MediumMessage message, Exception ex)
@@ -143,9 +220,11 @@ internal class SubscribeExecutor : ISubscribeExecutor
         // The lease covers the whole dispatch, including the in-process attempts that follow this write.
         if (!needRetry) message.LeasedUntil = null;
 
-        await _dataStorage.ChangeReceiveStateAsync(message, StatusName.Failed).ConfigureAwait(false);
+        if (await _dataStorage.ChangeReceiveStateAsync(message, StatusName.Failed).ConfigureAwait(false)) return needRetry;
 
-        return needRetry;
+        // Another run owns the row now; a further in-process attempt here would run beside it.
+        _logger.LogWarning("Received message {MessageId} failed, but its lease was taken over before the result was written; leaving the message to the new owner.", message.DbId);
+        return false;
     }
 
     private bool UpdateMessageForRetry(MediumMessage message)

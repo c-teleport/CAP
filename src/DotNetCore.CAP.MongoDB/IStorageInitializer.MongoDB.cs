@@ -102,7 +102,7 @@ public class MongoDBStorageInitializer : IStorageInitializer
             {
                 new(builder.Ascending(x => x.Name)),
                 new(builder.Ascending(x => x.StatusName).Ascending(x => x.ExpiresAt)),
-                new(builder.Ascending(x => x.StatusName).Ascending(x => x.Added).Ascending(x => x.LeasedUntil))
+                new(builder.Ascending(x => x.StatusName).Ascending(x => x.Added))
             };
 
             await col.Indexes.CreateManyAsync(indexes, cancellationToken);
@@ -128,7 +128,7 @@ public class MongoDBStorageInitializer : IStorageInitializer
             var obsoleteIndexes = new HashSet<string> {
                 "Name", "Added", "ExpiresAt", "StatusName", "Retries", "Version",
                 "Added_1", "ExpiresAt_1", "StatusName_1", "Retries_1", "Version_1",
-                "StatusName_1_Added_1" };
+                "StatusName_1_Added_1_LeasedUntil_1" };
            
             var col = database.GetCollection<ReceivedMessage>(options.ReceivedCollection);
            

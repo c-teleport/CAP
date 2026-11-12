@@ -115,12 +115,14 @@ public class PostgreSqlDataStorage : IDataStorage
         await ChangeMessageStateAsync(_pubName, message, state, transaction).ConfigureAwait(false);
     }
 
-    public async Task ChangeReceiveStateAsync(MediumMessage message, StatusName state)
+    public async Task<bool> ChangeReceiveStateAsync(MediumMessage message, StatusName state)
     {
+        var held = message.HeldLease;
         var sql =
-            $"UPDATE {_recName} SET \"Content\"=@Content,\"Retries\"=@Retries,\"ExpiresAt\"=@ExpiresAt,\"StatusName\"=@StatusName,\"LeasedUntil\"=@LeasedUntil WHERE \"Id\"=@Id";
+            $"UPDATE {_recName} SET \"Content\"=@Content,\"Retries\"=@Retries,\"ExpiresAt\"=@ExpiresAt,\"StatusName\"=@StatusName,\"LeasedUntil\"=@LeasedUntil WHERE \"Id\"=@Id" +
+            (held.HasValue ? " AND \"LeasedUntil\"=@HeldLease" : string.Empty);
 
-        object[] sqlParams =
+        var sqlParams = new List<object>
         {
             new NpgsqlParameter("@Id", long.Parse(message.DbId)),
             new NpgsqlParameter("@Content", _serializer.Serialize(message.Origin)),
@@ -129,10 +131,14 @@ public class PostgreSqlDataStorage : IDataStorage
             new NpgsqlParameter("@StatusName", state.ToString("G")),
             new NpgsqlParameter("@LeasedUntil", message.LeasedUntil.HasValue ? message.LeasedUntil.Value : DBNull.Value)
         };
+        if (held.HasValue) sqlParams.Add(new NpgsqlParameter("@HeldLease", held.Value));
 
         var connection = _options.Value.CreateConnection();
         await using var _ = connection.ConfigureAwait(false);
-        await connection.ExecuteNonQueryAsync(sql, sqlParams: sqlParams).ConfigureAwait(false);
+        if (await connection.ExecuteNonQueryAsync(sql, sqlParams: sqlParams.ToArray()).ConfigureAwait(false) != 1) return false;
+
+        message.HeldLease = message.LeasedUntil;
+        return true;
     }
 
     public async Task<bool> TryLeaseReceivedMessageAsync(MediumMessage message, TimeSpan lease)
@@ -158,6 +164,30 @@ public class PostgreSqlDataStorage : IDataStorage
 
         message.StatusName = StatusName.Scheduled;
         message.LeasedUntil = leasedUntil;
+        message.HeldLease = leasedUntil;
+        return true;
+    }
+
+    public async Task<bool> TryRenewReceivedMessageLeaseAsync(MediumMessage message, TimeSpan lease)
+    {
+        if (message.LeasedUntil is not { } current) return false;
+
+        var leasedUntil = DateTime.Now.Add(lease);
+        var sql = $"UPDATE {_recName} SET \"LeasedUntil\"=@LeasedUntil WHERE \"Id\"=@Id AND \"LeasedUntil\"=@Current;";
+
+        object[] sqlParams =
+        {
+            new NpgsqlParameter("@Id", long.Parse(message.DbId)),
+            new NpgsqlParameter("@Current", current),
+            new NpgsqlParameter("@LeasedUntil", leasedUntil)
+        };
+
+        var connection = _options.Value.CreateConnection();
+        await using var _ = connection.ConfigureAwait(false);
+        if (await connection.ExecuteNonQueryAsync(sql, sqlParams: sqlParams).ConfigureAwait(false) != 1) return false;
+
+        message.LeasedUntil = leasedUntil;
+        message.HeldLease = leasedUntil;
         return true;
     }
 
@@ -218,7 +248,8 @@ public class PostgreSqlDataStorage : IDataStorage
             new NpgsqlParameter("@Retries", _capOptions.Value.FailedRetryCount),
             new NpgsqlParameter("@Added", DateTime.Now),
             new NpgsqlParameter("@ExpiresAt", DateTime.Now.AddSeconds(_capOptions.Value.FailedMessageExpiredAfter)),
-            new NpgsqlParameter("@StatusName", nameof(StatusName.Failed))
+            new NpgsqlParameter("@StatusName", nameof(StatusName.Failed)),
+            new NpgsqlParameter("@LeasedUntil", DBNull.Value)
         };
 
         await StoreReceivedMessage(sqlParams).ConfigureAwait(false);
@@ -232,8 +263,11 @@ public class PostgreSqlDataStorage : IDataStorage
             Origin = message,
             Added = DateTime.Now,
             ExpiresAt = null,
-            Retries = 0
+            Retries = 0,
+            StatusName = StatusName.Scheduled
         };
+        mdMessage.LeasedUntil = mdMessage.Added.AddSeconds(_capOptions.Value.ReceivedMessageLeaseSeconds);
+        mdMessage.HeldLease = mdMessage.LeasedUntil;
 
         object[] sqlParams =
         {
@@ -244,7 +278,8 @@ public class PostgreSqlDataStorage : IDataStorage
             new NpgsqlParameter("@Retries", mdMessage.Retries),
             new NpgsqlParameter("@Added", mdMessage.Added),
             new NpgsqlParameter("@ExpiresAt", mdMessage.ExpiresAt.HasValue ? mdMessage.ExpiresAt.Value : DBNull.Value),
-            new NpgsqlParameter("@StatusName", nameof(StatusName.Scheduled))
+            new NpgsqlParameter("@StatusName", nameof(StatusName.Scheduled)),
+            new NpgsqlParameter("@LeasedUntil", mdMessage.LeasedUntil!.Value)
         };
 
         await StoreReceivedMessage(sqlParams).ConfigureAwait(false);
@@ -383,8 +418,8 @@ public class PostgreSqlDataStorage : IDataStorage
     private async Task StoreReceivedMessage(object[] sqlParams)
     {
         var sql =
-            $"INSERT INTO {_recName}(\"Id\",\"Version\",\"Name\",\"Group\",\"Content\",\"Retries\",\"Added\",\"ExpiresAt\",\"StatusName\")" +
-            $"VALUES(@Id,'{_capOptions.Value.Version}',@Name,@Group,@Content,@Retries,@Added,@ExpiresAt,@StatusName) RETURNING \"Id\";";
+            $"INSERT INTO {_recName}(\"Id\",\"Version\",\"Name\",\"Group\",\"Content\",\"Retries\",\"Added\",\"ExpiresAt\",\"StatusName\",\"LeasedUntil\")" +
+            $"VALUES(@Id,'{_capOptions.Value.Version}',@Name,@Group,@Content,@Retries,@Added,@ExpiresAt,@StatusName,@LeasedUntil) RETURNING \"Id\";";
 
         var connection = _options.Value.CreateConnection();
         await using var _ = connection.ConfigureAwait(false);
@@ -396,12 +431,13 @@ public class PostgreSqlDataStorage : IDataStorage
     {
         var now = DateTime.Now;
         var fourMinAgo = now.Subtract(lookbackSeconds);
+        var leaseBound = now.AddSeconds(-_capOptions.Value.ReceivedMessageLeaseSeconds);
 
         // Received rows: a message is eligible when its retry lease expired, or it never had one and is past the
         // lookback window, or it was flagged for immediate retry on graceful shutdown. Published rows have no lease.
         var sql = includeImmediateRetry
             ? $"SELECT \"Id\",\"Content\",\"Retries\",\"Added\",\"StatusName\",\"LeasedUntil\" FROM {tableName} WHERE \"Retries\"<@Retries " +
-              $"AND ((\"StatusName\" IN ('{StatusName.Failed}','{StatusName.Scheduled}') AND ((\"LeasedUntil\" IS NULL AND \"Added\"<@Added) OR \"LeasedUntil\"<@Now)) " +
+              $"AND ((\"StatusName\" IN ('{StatusName.Failed}','{StatusName.Scheduled}') AND \"Added\"<@AddedBound AND ((\"LeasedUntil\" IS NULL AND \"Added\"<@Added) OR (\"LeasedUntil\"<@Now AND \"Added\"<@LeaseAdded))) " +
               $"OR \"StatusName\"='{StatusName.RetryImmediately}') ORDER BY \"Added\" LIMIT 200;"
             : $"SELECT \"Id\",\"Content\",\"Retries\",\"Added\",\"StatusName\",NULL FROM {tableName} WHERE \"Retries\"<@Retries " +
               $"AND \"Added\"<@Added AND \"StatusName\" IN ('{StatusName.Failed}','{StatusName.Scheduled}') ORDER BY \"Added\" LIMIT 200;";
@@ -410,7 +446,11 @@ public class PostgreSqlDataStorage : IDataStorage
         {
             new NpgsqlParameter("@Retries", _capOptions.Value.FailedRetryCount),
             new NpgsqlParameter("@Added", fourMinAgo),
-            new NpgsqlParameter("@Now", now)
+            new NpgsqlParameter("@Now", now),
+            // An expired lease implies Added < now - lease. @AddedBound repeats the later of the two bounds outside the OR,
+            // where the planner can use it to skip rows that were only just stored.
+            new NpgsqlParameter("@LeaseAdded", leaseBound),
+            new NpgsqlParameter("@AddedBound", leaseBound > fourMinAgo ? leaseBound : fourMinAgo)
         };
 
         var connection = _options.Value.CreateConnection();

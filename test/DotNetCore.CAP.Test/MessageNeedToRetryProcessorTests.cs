@@ -41,15 +41,16 @@ public class MessageNeedToRetryProcessorTests
     }
 
     [Fact]
-    public async Task ProcessAsync_LeasesForTheLookbackWindow()
+    public async Task ProcessAsync_LeasesForTheConfiguredLease_NotTheLookbackWindow()
     {
         var message = CreateMessage("1");
         _storage.GetReceivedMessagesOfNeedRetry(Arg.Any<TimeSpan>()).Returns(new[] { message });
         _storage.TryLeaseReceivedMessageAsync(message, Arg.Any<TimeSpan>()).Returns(true);
         _dispatcher.EnqueueToExecute(Arg.Any<MediumMessage>(), Arg.Any<ConsumerExecutorDescriptor>()).Returns(true);
 
-        await RunOnceAsync(() => LeaseAttempts() == 1, lookbackSeconds: 75);
+        await RunOnceAsync(() => LeaseAttempts() == 1, leaseSeconds: 75);
 
+        await _storage.Received(1).GetReceivedMessagesOfNeedRetry(TimeSpan.FromSeconds(240));
         await _storage.Received(1).TryLeaseReceivedMessageAsync(message, TimeSpan.FromSeconds(75));
     }
 
@@ -66,15 +67,33 @@ public class MessageNeedToRetryProcessorTests
         await _storage.Received(1).ChangeReceiveStateToImmediateRetryAsync(Arg.Is<string[]>(ids => ids.Length == 1 && ids[0] == "2"));
     }
 
+    [Fact]
+    public async Task ProcessAsync_DoesNotStartASecondPoll_WhileThePreviousOneIsStillRunning()
+    {
+        var firstPoll = new TaskCompletionSource<IEnumerable<MediumMessage>>();
+        _storage.GetReceivedMessagesOfNeedRetry(Arg.Any<TimeSpan>()).Returns(_ => firstPoll.Task);
+        var options = Options.Create(new CapOptions { UseStorageLock = false, FailedRetryInterval = 1 });
+        var processor = new MessageNeedToRetryProcessor(options, NullLogger<MessageNeedToRetryProcessor>.Instance, _dispatcher, _storage);
+        var provider = new ServiceCollection().AddSingleton(_storage).BuildServiceProvider();
+        using var cts = new CancellationTokenSource();
+        using var context = new ProcessingContext(provider, cts.Token);
+
+        await processor.ProcessAsync(context);
+        await processor.ProcessAsync(context);
+
+        await _storage.Received(1).GetReceivedMessagesOfNeedRetry(Arg.Any<TimeSpan>());
+        firstPoll.SetResult(Array.Empty<MediumMessage>());
+    }
+
     private int LeaseAttempts() => _storage.ReceivedCalls().Count(c => c.GetMethodInfo().Name == nameof(IDataStorage.TryLeaseReceivedMessageAsync));
 
     private int Flagged() => _storage.ReceivedCalls().Count(c => c.GetMethodInfo().Name == nameof(IDataStorage.ChangeReceiveStateToImmediateRetryAsync));
 
     // ProcessAsync starts the received-retry loop on a background task and then waits one interval, so the
     // assertions wait for the loop to reach the observed call instead of racing it.
-    private async Task RunOnceAsync(Func<bool> done, int lookbackSeconds = 240)
+    private async Task RunOnceAsync(Func<bool> done, int leaseSeconds = 60)
     {
-        var options = Options.Create(new CapOptions { UseStorageLock = false, FailedRetryInterval = 1, FallbackWindowLookbackSeconds = lookbackSeconds });
+        var options = Options.Create(new CapOptions { UseStorageLock = false, FailedRetryInterval = 1, ReceivedMessageLeaseSeconds = leaseSeconds });
         var processor = new MessageNeedToRetryProcessor(options, NullLogger<MessageNeedToRetryProcessor>.Instance, _dispatcher, _storage);
         var provider = new ServiceCollection().AddSingleton(_storage).BuildServiceProvider();
         using var cts = new CancellationTokenSource();

@@ -114,12 +114,14 @@ public class SqlServerDataStorage : IDataStorage
         await ChangeMessageStateAsync(_pubName, message, state, transaction).ConfigureAwait(false);
     }
 
-    public async Task ChangeReceiveStateAsync(MediumMessage message, StatusName state)
+    public async Task<bool> ChangeReceiveStateAsync(MediumMessage message, StatusName state)
     {
+        var held = message.HeldLease;
         var sql =
-            $"UPDATE {_recName} SET Content=@Content, Retries=@Retries,ExpiresAt=@ExpiresAt,StatusName=@StatusName,LeasedUntil=@LeasedUntil WHERE Id=@Id";
+            $"UPDATE {_recName} SET Content=@Content, Retries=@Retries,ExpiresAt=@ExpiresAt,StatusName=@StatusName,LeasedUntil=@LeasedUntil WHERE Id=@Id" +
+            (held.HasValue ? " AND LeasedUntil=@HeldLease" : string.Empty);
 
-        object[] sqlParams =
+        var sqlParams = new List<object>
         {
             new SqlParameter("@Id", message.DbId),
             new SqlParameter("@Content", _serializer.Serialize(message.Origin)),
@@ -128,10 +130,14 @@ public class SqlServerDataStorage : IDataStorage
             new SqlParameter("@StatusName", state.ToString("G")),
             new SqlParameter("@LeasedUntil", message.LeasedUntil.HasValue ? message.LeasedUntil.Value : DBNull.Value) { SqlDbType = SqlDbType.DateTime2 }
         };
+        if (held.HasValue) sqlParams.Add(new SqlParameter("@HeldLease", held.Value) { SqlDbType = SqlDbType.DateTime2 });
 
         var connection = new SqlConnection(_options.Value.ConnectionString);
         await using var _ = connection.ConfigureAwait(false);
-        await connection.ExecuteNonQueryAsync(sql, sqlParams: sqlParams).ConfigureAwait(false);
+        if (await connection.ExecuteNonQueryAsync(sql, sqlParams: sqlParams.ToArray()).ConfigureAwait(false) != 1) return false;
+
+        message.HeldLease = message.LeasedUntil;
+        return true;
     }
 
     public async Task<bool> TryLeaseReceivedMessageAsync(MediumMessage message, TimeSpan lease)
@@ -147,8 +153,8 @@ public class SqlServerDataStorage : IDataStorage
             new SqlParameter("@Id", message.DbId),
             new SqlParameter("@ExpectedStatus", message.StatusName.ToString("G")),
             new SqlParameter("@ExpectedRetries", message.Retries),
-            new SqlParameter("@Now", now),
-            new SqlParameter("@LeasedUntil", leasedUntil)
+            new SqlParameter("@Now", now) { SqlDbType = SqlDbType.DateTime2 },
+            new SqlParameter("@LeasedUntil", leasedUntil) { SqlDbType = SqlDbType.DateTime2 }
         };
 
         var connection = new SqlConnection(_options.Value.ConnectionString);
@@ -157,6 +163,30 @@ public class SqlServerDataStorage : IDataStorage
 
         message.StatusName = StatusName.Scheduled;
         message.LeasedUntil = leasedUntil;
+        message.HeldLease = leasedUntil;
+        return true;
+    }
+
+    public async Task<bool> TryRenewReceivedMessageLeaseAsync(MediumMessage message, TimeSpan lease)
+    {
+        if (message.LeasedUntil is not { } current) return false;
+
+        var leasedUntil = DateTime.Now.Add(lease);
+        var sql = $"UPDATE {_recName} SET LeasedUntil = @LeasedUntil WHERE Id = @Id AND LeasedUntil = @Current;";
+
+        object[] sqlParams =
+        {
+            new SqlParameter("@Id", message.DbId),
+            new SqlParameter("@Current", current) { SqlDbType = SqlDbType.DateTime2 },
+            new SqlParameter("@LeasedUntil", leasedUntil) { SqlDbType = SqlDbType.DateTime2 }
+        };
+
+        var connection = new SqlConnection(_options.Value.ConnectionString);
+        await using var _ = connection.ConfigureAwait(false);
+        if (await connection.ExecuteNonQueryAsync(sql, sqlParams: sqlParams).ConfigureAwait(false) != 1) return false;
+
+        message.LeasedUntil = leasedUntil;
+        message.HeldLease = leasedUntil;
         return true;
     }
 
@@ -217,7 +247,8 @@ public class SqlServerDataStorage : IDataStorage
             new SqlParameter("@Retries", _capOptions.Value.FailedRetryCount),
             new SqlParameter("@Added", DateTime.Now),
             new SqlParameter("@ExpiresAt", DateTime.Now.AddSeconds(_capOptions.Value.FailedMessageExpiredAfter)),
-            new SqlParameter("@StatusName", nameof(StatusName.Failed))
+            new SqlParameter("@StatusName", nameof(StatusName.Failed)),
+            new SqlParameter("@LeasedUntil", DBNull.Value) { SqlDbType = SqlDbType.DateTime2 }
         };
 
         await StoreReceivedMessage(sqlParams).ConfigureAwait(false);
@@ -231,8 +262,11 @@ public class SqlServerDataStorage : IDataStorage
             Origin = message,
             Added = DateTime.Now,
             ExpiresAt = null,
-            Retries = 0
+            Retries = 0,
+            StatusName = StatusName.Scheduled
         };
+        mdMessage.LeasedUntil = mdMessage.Added.AddSeconds(_capOptions.Value.ReceivedMessageLeaseSeconds);
+        mdMessage.HeldLease = mdMessage.LeasedUntil;
 
         object[] sqlParams =
         {
@@ -243,7 +277,8 @@ public class SqlServerDataStorage : IDataStorage
             new SqlParameter("@Retries", mdMessage.Retries),
             new SqlParameter("@Added", mdMessage.Added),
             new SqlParameter("@ExpiresAt", mdMessage.ExpiresAt.HasValue ? mdMessage.ExpiresAt.Value : DBNull.Value),
-            new SqlParameter("@StatusName", nameof(StatusName.Scheduled))
+            new SqlParameter("@StatusName", nameof(StatusName.Scheduled)),
+            new SqlParameter("@LeasedUntil", mdMessage.LeasedUntil!.Value) { SqlDbType = SqlDbType.DateTime2 }
         };
 
         await StoreReceivedMessage(sqlParams).ConfigureAwait(false);
@@ -380,8 +415,8 @@ public class SqlServerDataStorage : IDataStorage
     private async Task StoreReceivedMessage(object[] sqlParams)
     {
         var sql =
-            $"INSERT INTO {_recName}([Id],[Version],[Name],[Group],[Content],[Retries],[Added],[ExpiresAt],[StatusName])" +
-            $"VALUES(@Id,'{_capOptions.Value.Version}',@Name,@Group,@Content,@Retries,@Added,@ExpiresAt,@StatusName);";
+            $"INSERT INTO {_recName}([Id],[Version],[Name],[Group],[Content],[Retries],[Added],[ExpiresAt],[StatusName],[LeasedUntil])" +
+            $"VALUES(@Id,'{_capOptions.Value.Version}',@Name,@Group,@Content,@Retries,@Added,@ExpiresAt,@StatusName,@LeasedUntil);";
 
         var connection = new SqlConnection(_options.Value.ConnectionString);
         await using var _ = connection.ConfigureAwait(false);
@@ -393,13 +428,14 @@ public class SqlServerDataStorage : IDataStorage
     {
         var now = DateTime.Now;
         var fourMinAgo = now.Subtract(lookbackSeconds);
+        var leaseBound = now.AddSeconds(-_capOptions.Value.ReceivedMessageLeaseSeconds);
 
         // Received rows: a message is eligible when its retry lease expired, or it never had one and is past the
         // lookback window, or it was flagged for immediate retry on graceful shutdown. Published rows have no lease.
         var sql = includeImmediateRetry
             ? $"SELECT TOP (200) Id, Content, Retries, Added, StatusName, LeasedUntil FROM {tableName} WITH (READPAST) " +
               $"WHERE Retries < @Retries AND Version = @Version AND ((StatusName IN ('{StatusName.Failed}', '{StatusName.Scheduled}') " +
-              $"AND ((LeasedUntil IS NULL AND Added < @Added) OR LeasedUntil < @Now)) OR StatusName = '{StatusName.RetryImmediately}');"
+              $"AND Added < @AddedBound AND ((LeasedUntil IS NULL AND Added < @Added) OR (LeasedUntil < @Now AND Added < @LeaseAdded))) OR StatusName = '{StatusName.RetryImmediately}');"
             : $"SELECT TOP (200) Id, Content, Retries, Added, StatusName, NULL FROM {tableName} WITH (READPAST) " +
               $"WHERE Retries < @Retries AND Version = @Version AND Added < @Added AND StatusName IN ('{StatusName.Failed}', '{StatusName.Scheduled}');";
 
@@ -408,7 +444,11 @@ public class SqlServerDataStorage : IDataStorage
             new SqlParameter("@Retries", _capOptions.Value.FailedRetryCount),
             new SqlParameter("@Version", _capOptions.Value.Version),
             new SqlParameter("@Added", fourMinAgo),
-            new SqlParameter("@Now", now)
+            new SqlParameter("@Now", now),
+            // An expired lease implies Added < now - lease. @AddedBound repeats the later of the two bounds outside the OR,
+            // where the planner can use it to skip rows that were only just stored.
+            new SqlParameter("@LeaseAdded", leaseBound),
+            new SqlParameter("@AddedBound", leaseBound > fourMinAgo ? leaseBound : fourMinAgo)
         };
 
         var connection = new SqlConnection(_options.Value.ConnectionString);

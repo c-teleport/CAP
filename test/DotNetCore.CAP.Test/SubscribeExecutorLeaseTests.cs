@@ -28,8 +28,21 @@ public class SubscribeExecutorLeaseTests
             {
                 var m = call.Arg<MediumMessage>();
                 _writes.Add((call.Arg<StatusName>(), m.LeasedUntil, m.Retries));
-                return Task.CompletedTask;
+                return Task.FromResult(true);
             });
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_StopsInProcessRetries_WhenTheFailedWriteWasFencedOut()
+    {
+        _storage.ChangeReceiveStateAsync(Arg.Any<MediumMessage>(), Arg.Any<StatusName>()).Returns(false);
+        _invoker.InvokeAsync(Arg.Any<ConsumerContext>(), Arg.Any<CancellationToken>()).Throws(new InvalidOperationException("boom"));
+        var executor = CreateExecutor(failedRetryCount: 3);
+
+        await executor.ExecuteAsync(CreateLeasedMessage(), CreateDescriptor(), CancellationToken.None);
+
+        await _invoker.Received(1).InvokeAsync(Arg.Any<ConsumerContext>(), Arg.Any<CancellationToken>());
+        await _storage.Received(1).ChangeReceiveStateAsync(Arg.Any<MediumMessage>(), StatusName.Failed);
     }
 
     [Fact]
@@ -74,13 +87,137 @@ public class SubscribeExecutorLeaseTests
         _writes.Should().ContainSingle().Which.LeasedUntil.Should().BeNull();
     }
 
-    private ISubscribeExecutor CreateExecutor(int failedRetryCount)
+    [Fact]
+    public async Task ExecuteAsync_RenewsTheLease_WhileALongHandlerRuns_AndStopsWhenItReturns()
+    {
+        // Lease 3 s, so the heartbeat fires every second; the handler outlives two of them.
+        _storage.TryRenewReceivedMessageLeaseAsync(Arg.Any<MediumMessage>(), Arg.Any<TimeSpan>()).Returns(true);
+        _invoker.InvokeAsync(Arg.Any<ConsumerContext>(), Arg.Any<CancellationToken>())
+            .Returns(async _ => { await Task.Delay(2500); return new ConsumerExecutedResult(null, "1", null, null); });
+        var executor = CreateExecutor(failedRetryCount: 3, leaseSeconds: 3);
+        var message = CreateLeasedMessage();
+
+        await executor.ExecuteAsync(message, CreateDescriptor(), CancellationToken.None);
+
+        var renewals = Renewals();
+        renewals.Should().BeGreaterThanOrEqualTo(1);
+        await _storage.Received().TryRenewReceivedMessageLeaseAsync(message, TimeSpan.FromSeconds(3));
+        _writes.Should().ContainSingle().Which.State.Should().Be(StatusName.Succeeded);
+
+        await Task.Delay(1500);
+        Renewals().Should().Be(renewals);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_DoesNotRenew_ForAShortHandler()
+    {
+        _invoker.InvokeAsync(Arg.Any<ConsumerContext>(), Arg.Any<CancellationToken>()).Returns(new ConsumerExecutedResult(null, "1", null, null));
+        var executor = CreateExecutor(failedRetryCount: 3, leaseSeconds: 3);
+
+        await executor.ExecuteAsync(CreateLeasedMessage(), CreateDescriptor(), CancellationToken.None);
+
+        Renewals().Should().Be(0);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_DoesNotRenew_WhenTheMessageHoldsNoLease()
+    {
+        _invoker.InvokeAsync(Arg.Any<ConsumerContext>(), Arg.Any<CancellationToken>())
+            .Returns(async _ => { await Task.Delay(1500); return new ConsumerExecutedResult(null, "1", null, null); });
+        var executor = CreateExecutor(failedRetryCount: 3, leaseSeconds: 3);
+        var message = CreateLeasedMessage();
+        message.LeasedUntil = null;
+
+        await executor.ExecuteAsync(message, CreateDescriptor(), CancellationToken.None);
+
+        Renewals().Should().Be(0);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_StopsRenewing_ButFinishesTheHandler_WhenTheLeaseWasLost()
+    {
+        _storage.TryRenewReceivedMessageLeaseAsync(Arg.Any<MediumMessage>(), Arg.Any<TimeSpan>()).Returns(false);
+        _invoker.InvokeAsync(Arg.Any<ConsumerContext>(), Arg.Any<CancellationToken>())
+            .Returns(async _ => { await Task.Delay(2500); return new ConsumerExecutedResult(null, "1", null, null); });
+        var executor = CreateExecutor(failedRetryCount: 3, leaseSeconds: 3);
+
+        await executor.ExecuteAsync(CreateLeasedMessage(), CreateDescriptor(), CancellationToken.None);
+
+        Renewals().Should().Be(1);
+        _writes.Should().ContainSingle().Which.State.Should().Be(StatusName.Succeeded);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_DoesNotRenew_WhileTheResultIsBeingWritten()
+    {
+        // Lease 3 s, heartbeat every second; the write outlives a heartbeat and must not be fenced out by one.
+        _invoker.InvokeAsync(Arg.Any<ConsumerContext>(), Arg.Any<CancellationToken>()).Returns(new ConsumerExecutedResult(null, "1", null, null));
+        _storage.ChangeReceiveStateAsync(Arg.Any<MediumMessage>(), Arg.Any<StatusName>())
+            .Returns(async _ => { await Task.Delay(1500); return true; });
+        var executor = CreateExecutor(failedRetryCount: 3, leaseSeconds: 3);
+
+        await executor.ExecuteAsync(CreateLeasedMessage(), CreateDescriptor(), CancellationToken.None);
+
+        Renewals().Should().Be(0);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_RenewsBeforeRunning_WhenTheMessageWaitedInTheBuffer()
+    {
+        _storage.TryRenewReceivedMessageLeaseAsync(Arg.Any<MediumMessage>(), Arg.Any<TimeSpan>()).Returns(true);
+        _invoker.InvokeAsync(Arg.Any<ConsumerContext>(), Arg.Any<CancellationToken>()).Returns(new ConsumerExecutedResult(null, "1", null, null));
+        var executor = CreateExecutor(failedRetryCount: 3);
+        var message = CreateLeasedMessage();
+        message.LeasedUntil = DateTime.Now.AddSeconds(10);
+
+        await executor.ExecuteAsync(message, CreateDescriptor(), CancellationToken.None);
+
+        Renewals().Should().Be(1);
+        _writes.Should().ContainSingle().Which.State.Should().Be(StatusName.Succeeded);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_SkipsTheHandler_WhenTheLeaseWasLostWhileBuffered()
+    {
+        _storage.TryRenewReceivedMessageLeaseAsync(Arg.Any<MediumMessage>(), Arg.Any<TimeSpan>()).Returns(false);
+        var executor = CreateExecutor(failedRetryCount: 3);
+        var message = CreateLeasedMessage();
+        message.LeasedUntil = DateTime.Now.AddSeconds(-1);
+
+        var result = await executor.ExecuteAsync(message, CreateDescriptor(), CancellationToken.None);
+
+        result.Succeeded.Should().BeFalse();
+        await _invoker.DidNotReceive().InvokeAsync(Arg.Any<ConsumerContext>(), Arg.Any<CancellationToken>());
+        _writes.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_StillRuns_WhenTheRenewalThrows_ButTheLeaseIsValid()
+    {
+        _storage.TryRenewReceivedMessageLeaseAsync(Arg.Any<MediumMessage>(), Arg.Any<TimeSpan>()).ThrowsAsync(new TimeoutException());
+        _invoker.InvokeAsync(Arg.Any<ConsumerContext>(), Arg.Any<CancellationToken>()).Returns(new ConsumerExecutedResult(null, "1", null, null));
+        var executor = CreateExecutor(failedRetryCount: 3);
+        var message = CreateLeasedMessage();
+        message.LeasedUntil = DateTime.Now.AddSeconds(10);
+
+        await executor.ExecuteAsync(message, CreateDescriptor(), CancellationToken.None);
+
+        _writes.Should().ContainSingle().Which.State.Should().Be(StatusName.Succeeded);
+    }
+
+    private int Renewals() => _storage.ReceivedCalls().Count(c => c.GetMethodInfo().Name == nameof(IDataStorage.TryRenewReceivedMessageLeaseAsync));
+
+    private ISubscribeExecutor CreateExecutor(int failedRetryCount, int leaseSeconds = 60)
     {
         var services = new ServiceCollection();
         services.AddLogging();
         services.AddSingleton(_storage);
         services.AddSingleton(_invoker);
-        services.AddCap(x => x.FailedRetryCount = failedRetryCount);
+        services.AddCap(x =>
+        {
+            x.FailedRetryCount = failedRetryCount;
+            x.ReceivedMessageLeaseSeconds = leaseSeconds;
+        });
         return services.BuildServiceProvider().GetRequiredService<ISubscribeExecutor>();
     }
 

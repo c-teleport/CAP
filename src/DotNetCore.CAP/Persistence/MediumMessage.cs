@@ -2,6 +2,7 @@
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
+using System.Threading;
 using DotNetCore.CAP.Internal;
 using DotNetCore.CAP.Messages;
 
@@ -24,6 +25,24 @@ public class MediumMessage
     /// <summary>Status the row had when it was read; the retry lease is granted only if it is unchanged.</summary>
     public StatusName StatusName { get; set; }
 
-    /// <summary>Until when a retry run owns this received message. Null when no retry run holds it.</summary>
-    public DateTime? LeasedUntil { get; set; }
+    // Boxed so the lease heartbeat and the executor can read/write them from different threads without tearing.
+    private object? _leasedUntil;
+    private object? _heldLease;
+
+    /// <summary>Until when the current run owns this received message. Null when nobody holds it.</summary>
+    public DateTime? LeasedUntil
+    {
+        get => (DateTime?)Volatile.Read(ref _leasedUntil);
+        set => Volatile.Write(ref _leasedUntil, value);
+    }
+
+    /// <summary>
+    /// The lease value the row carries in storage for this run. Storage maintains it; state writes are fenced on it
+    /// so a run whose lease was taken over cannot overwrite the new owner's result. Null when no lease is held.
+    /// </summary>
+    public DateTime? HeldLease
+    {
+        get => (DateTime?)Volatile.Read(ref _heldLease);
+        set => Volatile.Write(ref _heldLease, value);
+    }
 }

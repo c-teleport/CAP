@@ -5,6 +5,7 @@ using System;
 using System.Data;
 using System.Threading;
 using System.Threading.Tasks;
+using DotNetCore.CAP.Internal;
 using DotNetCore.CAP.Persistence;
 using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Logging;
@@ -88,8 +89,9 @@ CREATE TABLE {GetReceivedTableName()}(
 )WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON) ON [PRIMARY]
 ) ON [PRIMARY] TEXTIMAGE_ON [PRIMARY]
 
-CREATE NONCLUSTERED INDEX [IX_{GetReceivedTableName()}_Version_StatusName_Added_LeasedUntil] ON {GetReceivedTableName()} ([Version] ASC,[StatusName] ASC,[Added] ASC,[LeasedUntil] ASC)
+CREATE NONCLUSTERED INDEX [IX_{GetReceivedTableName()}_Retry_Version_StatusName_Added_LeasedUntil] ON {GetReceivedTableName()} ([Version] ASC,[StatusName] ASC,[Added] ASC,[LeasedUntil] ASC)
 INCLUDE ([Id], [Content], [Retries])
+WHERE [StatusName] IN (N'{StatusName.Failed}', N'{StatusName.Scheduled}', N'{StatusName.RetryImmediately}')
 
 CREATE NONCLUSTERED INDEX [IX_{GetReceivedTableName()}_ExpiresAt_StatusName] ON {GetReceivedTableName()} ([ExpiresAt] ASC,[StatusName] ASC)
 
@@ -101,9 +103,13 @@ BEGIN TRY
     IF COL_LENGTH(N'{GetReceivedTableName()}', 'LeasedUntil') IS NULL
         ALTER TABLE {GetReceivedTableName()} ADD [LeasedUntil] [datetime2](7) NULL;
 
-    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_{GetReceivedTableName()}_Version_StatusName_Added_LeasedUntil' AND object_id = OBJECT_ID(N'{GetReceivedTableName()}'))
-        CREATE NONCLUSTERED INDEX [IX_{GetReceivedTableName()}_Version_StatusName_Added_LeasedUntil] ON {GetReceivedTableName()} ([Version] ASC,[StatusName] ASC,[Added] ASC,[LeasedUntil] ASC)
-        INCLUDE ([Id], [Content], [Retries]);
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_{GetReceivedTableName()}_Retry_Version_StatusName_Added_LeasedUntil' AND object_id = OBJECT_ID(N'{GetReceivedTableName()}'))
+        CREATE NONCLUSTERED INDEX [IX_{GetReceivedTableName()}_Retry_Version_StatusName_Added_LeasedUntil] ON {GetReceivedTableName()} ([Version] ASC,[StatusName] ASC,[Added] ASC,[LeasedUntil] ASC)
+        INCLUDE ([Id], [Content], [Retries])
+        WHERE [StatusName] IN (N'{StatusName.Failed}', N'{StatusName.Scheduled}', N'{StatusName.RetryImmediately}');
+
+    IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_{GetReceivedTableName()}_Version_StatusName_Added_LeasedUntil' AND object_id = OBJECT_ID(N'{GetReceivedTableName()}'))
+        DROP INDEX [IX_{GetReceivedTableName()}_Version_StatusName_Added_LeasedUntil] ON {GetReceivedTableName()};
 
     IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_{GetReceivedTableName()}_Version_ExpiresAt_StatusName' AND object_id = OBJECT_ID(N'{GetReceivedTableName()}'))
         DROP INDEX [IX_{GetReceivedTableName()}_Version_ExpiresAt_StatusName] ON {GetReceivedTableName()};

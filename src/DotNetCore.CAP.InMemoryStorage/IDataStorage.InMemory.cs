@@ -112,14 +112,33 @@ internal class InMemoryStorage : IDataStorage
 
         message.StatusName = stored.StatusName;
         message.LeasedUntil = stored.LeasedUntil;
+        message.HeldLease = stored.LeasedUntil;
         return Task.FromResult(true);
     }
 
-    public Task ChangeReceiveStateAsync(MediumMessage message, StatusName state)
+    public Task<bool> TryRenewReceivedMessageLeaseAsync(MediumMessage message, TimeSpan lease)
+    {
+        if (message.LeasedUntil is not { } current || !ReceivedMessages.TryGetValue(message.DbId, out var stored))
+            return Task.FromResult(false);
+
+        lock (stored)
+        {
+            if (stored.LeasedUntil != current) return Task.FromResult(false);
+            stored.LeasedUntil = DateTime.Now.Add(lease);
+        }
+
+        message.LeasedUntil = stored.LeasedUntil;
+        message.HeldLease = stored.LeasedUntil;
+        return Task.FromResult(true);
+    }
+
+    public Task<bool> ChangeReceiveStateAsync(MediumMessage message, StatusName state)
     {
         var stored = ReceivedMessages[message.DbId];
         lock (stored)
         {
+            if (message.HeldLease is { } held && stored.LeasedUntil != held) return Task.FromResult(false);
+
             stored.StatusName = state;
             stored.ExpiresAt = message.ExpiresAt;
             stored.Content = _serializer.Serialize(message.Origin);
@@ -127,7 +146,8 @@ internal class InMemoryStorage : IDataStorage
             stored.LeasedUntil = message.LeasedUntil;
         }
 
-        return Task.CompletedTask;
+        message.HeldLease = message.LeasedUntil;
+        return Task.FromResult(true);
     }
 
     public Task<MediumMessage> StoreMessageAsync(string name, Message content, object? dbTransaction = null)
@@ -185,8 +205,11 @@ internal class InMemoryStorage : IDataStorage
             Origin = message,
             Added = DateTime.Now,
             ExpiresAt = null,
-            Retries = 0
+            Retries = 0,
+            StatusName = StatusName.Scheduled
         };
+        mdMessage.LeasedUntil = mdMessage.Added.AddSeconds(_capOptions.Value.ReceivedMessageLeaseSeconds);
+        mdMessage.HeldLease = mdMessage.LeasedUntil;
 
         ReceivedMessages[mdMessage.DbId] = new MemoryMessage
         {
@@ -198,7 +221,8 @@ internal class InMemoryStorage : IDataStorage
             Retries = mdMessage.Retries,
             Added = mdMessage.Added,
             ExpiresAt = mdMessage.ExpiresAt,
-            StatusName = StatusName.Scheduled
+            StatusName = StatusName.Scheduled,
+            LeasedUntil = mdMessage.LeasedUntil
         };
 
         return Task.FromResult(mdMessage);
@@ -259,7 +283,7 @@ internal class InMemoryStorage : IDataStorage
         IEnumerable<MediumMessage> result = ReceivedMessages.Values
             .Where(x => x.Retries < _capOptions.Value.FailedRetryCount
                         && (((x.StatusName == StatusName.Scheduled || x.StatusName == StatusName.Failed)
-                             && (x.LeasedUntil == null ? x.Added < now.Subtract(lookbackSeconds) : x.LeasedUntil < now))
+                             && (x.LeasedUntil == null ? x.Added < now.Subtract(lookbackSeconds) : x.LeasedUntil < now && x.Added < now.AddSeconds(-_capOptions.Value.ReceivedMessageLeaseSeconds)))
                             || x.StatusName == StatusName.RetryImmediately))
             .Take(200)
             .Select(Snapshot).ToList();

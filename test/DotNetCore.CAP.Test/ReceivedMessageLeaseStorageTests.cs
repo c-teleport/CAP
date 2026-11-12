@@ -18,11 +18,15 @@ public class ReceivedMessageLeaseStorageTests
 
     // Note: InMemoryStorage uses static dictionaries shared across parallel tests, so these tests only assert
     // about their own (uniquely-generated) message ids rather than clearing the shared store.
-    private static IDataStorage CreateStorage()
+    private static IDataStorage CreateStorage(int leaseSeconds = 60)
     {
         var services = new ServiceCollection();
         services.AddLogging();
-        services.AddCap(x => x.UseInMemoryStorage());
+        services.AddCap(x =>
+        {
+            x.ReceivedMessageLeaseSeconds = leaseSeconds;
+            x.UseInMemoryStorage();
+        });
         return services.BuildServiceProvider().GetRequiredService<IDataStorage>();
     }
 
@@ -33,6 +37,113 @@ public class ReceivedMessageLeaseStorageTests
         var message = await storage.StoreReceivedMessageAsync("test.topic", "group", CreateMessage());
 
         (await storage.GetReceivedMessagesOfNeedRetry(Lookback)).Select(m => m.DbId).Should().NotContain(message.DbId);
+    }
+
+    [Fact]
+    public async Task StoreReceivedMessage_LeasesTheRowToTheStoringInstance()
+    {
+        var storage = CreateStorage(leaseSeconds: 60);
+
+        var message = await storage.StoreReceivedMessageAsync("test.topic", "group", CreateMessage());
+
+        message.StatusName.Should().Be(StatusName.Scheduled);
+        message.LeasedUntil.Should().BeCloseTo(DateTime.Now.AddSeconds(60), TimeSpan.FromSeconds(5));
+        // Even with no lookback at all the row stays hidden: the lease, not Added, decides eligibility now.
+        (await storage.GetReceivedMessagesOfNeedRetry(TimeSpan.Zero)).Select(m => m.DbId).Should().NotContain(message.DbId);
+    }
+
+    [Fact]
+    public async Task GetReceivedMessagesOfNeedRetry_ReturnsFreshRow_OnceItsInitialLeaseExpired()
+    {
+        var storage = CreateStorage(leaseSeconds: -1);
+
+        var message = await storage.StoreReceivedMessageAsync("test.topic", "group", CreateMessage());
+
+        // The row was added a moment ago, well inside the lookback; the expired lease alone makes it eligible.
+        var recovered = (await storage.GetReceivedMessagesOfNeedRetry(Lookback)).Single(m => m.DbId == message.DbId);
+        recovered.StatusName.Should().Be(StatusName.Scheduled);
+        (await storage.TryLeaseReceivedMessageAsync(recovered, Lease)).Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task GetReceivedMessagesOfNeedRetry_SkipsRow_StoredWithinTheLeasePeriod()
+    {
+        var storage = CreateStorage(leaseSeconds: 60);
+        var picked = await StoreFlaggedAndReadAsync(storage);
+
+        // A lease shorter than the configured one: recovery waits until the row is one configured lease old.
+        (await storage.TryLeaseReceivedMessageAsync(picked, TimeSpan.FromSeconds(-1))).Should().BeTrue();
+
+        (await storage.GetReceivedMessagesOfNeedRetry(Lookback)).Select(m => m.DbId).Should().NotContain(picked.DbId);
+    }
+
+    [Fact]
+    public async Task TryRenew_ExtendsTheLease_WhileTheCallerStillHoldsIt()
+    {
+        var storage = CreateStorage(leaseSeconds: 1);
+        var message = await storage.StoreReceivedMessageAsync("test.topic", "group", CreateMessage());
+        var before = message.LeasedUntil!.Value;
+
+        (await storage.TryRenewReceivedMessageLeaseAsync(message, Lease)).Should().BeTrue();
+
+        message.LeasedUntil.Should().BeAfter(before);
+        message.LeasedUntil.Should().BeCloseTo(DateTime.Now.Add(Lease), TimeSpan.FromSeconds(5));
+        (await storage.GetReceivedMessagesOfNeedRetry(TimeSpan.Zero)).Select(m => m.DbId).Should().NotContain(message.DbId);
+    }
+
+    [Fact]
+    public async Task TryRenew_RefusesACaller_WhoseLeaseWasTakenOver()
+    {
+        var storage = CreateStorage(leaseSeconds: -1);
+        var lost = await storage.StoreReceivedMessageAsync("test.topic", "group", CreateMessage());
+        var taken = (await storage.GetReceivedMessagesOfNeedRetry(Lookback)).Single(m => m.DbId == lost.DbId);
+        (await storage.TryLeaseReceivedMessageAsync(taken, Lease)).Should().BeTrue();
+
+        (await storage.TryRenewReceivedMessageLeaseAsync(lost, Lease)).Should().BeFalse();
+        (await storage.TryRenewReceivedMessageLeaseAsync(taken, Lease)).Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task ChangeReceiveState_IsFencedOut_WhenTheLeaseWasTakenOver()
+    {
+        var storage = CreateStorage(leaseSeconds: -1);
+        var lost = await storage.StoreReceivedMessageAsync("test.topic", "group", CreateMessage());
+        var taken = (await storage.GetReceivedMessagesOfNeedRetry(Lookback)).Single(m => m.DbId == lost.DbId);
+        (await storage.TryLeaseReceivedMessageAsync(taken, Lease)).Should().BeTrue();
+
+        // The late run finishes with Failed after the row was taken over; its write must not land.
+        lost.Retries = 1;
+        lost.ExpiresAt = DateTime.Now.AddHours(1);
+        lost.LeasedUntil = null;
+        (await storage.ChangeReceiveStateAsync(lost, StatusName.Failed)).Should().BeFalse();
+
+        (await storage.GetReceivedMessagesOfNeedRetry(TimeSpan.Zero)).Select(m => m.DbId).Should().NotContain(lost.DbId);
+        taken.ExpiresAt = DateTime.Now.AddHours(1);
+        taken.LeasedUntil = null;
+        (await storage.ChangeReceiveStateAsync(taken, StatusName.Succeeded)).Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task ChangeReceiveState_Applies_WhenTheRunHoldsNoLease()
+    {
+        var storage = CreateStorage();
+        var stored = await storage.StoreReceivedMessageAsync("test.topic", "group", CreateMessage());
+
+        // A dashboard re-execute or a pre-upgrade row: no lease to fence on, the write goes through.
+        var unleased = new MediumMessage { DbId = stored.DbId, Origin = stored.Origin, ExpiresAt = DateTime.Now.AddHours(1) };
+        (await storage.ChangeReceiveStateAsync(unleased, StatusName.Succeeded)).Should().BeTrue();
+
+        (await storage.ChangeReceiveStateAsync(stored, StatusName.Failed)).Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task TryRenew_RefusesAMessage_WithoutALease()
+    {
+        var storage = CreateStorage();
+        var message = await storage.StoreReceivedMessageAsync("test.topic", "group", CreateMessage());
+        message.LeasedUntil = null;
+
+        (await storage.TryRenewReceivedMessageLeaseAsync(message, Lease)).Should().BeFalse();
     }
 
     [Fact]
@@ -65,7 +176,7 @@ public class ReceivedMessageLeaseStorageTests
     [Fact]
     public async Task GetReceivedMessagesOfNeedRetry_ReturnsLeasedMessage_OnceTheLeaseExpired()
     {
-        var storage = CreateStorage();
+        var storage = CreateStorage(leaseSeconds: -1);
         var picked = await StoreFlaggedAndReadAsync(storage);
 
         // A lease that is already over models a retry run that died without writing a final state.
