@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
@@ -298,6 +298,40 @@ public class DispatcherTests
     }
 
     [Fact]
+    public async Task DrainReceivedAsync_ReleasesCallbackBlockedOnFullBuffer_WithRejection()
+    {
+        var options = Options.Create(new CapOptions
+        {
+            EnableSubscriberParallelExecute = true,
+            SubscriberParallelExecuteThreadCount = 1,
+            SubscriberParallelExecuteBufferFactor = 1
+        });
+        var executing = new TaskCompletionSource<OperateResult>();
+        _executor.ExecuteAsync(Arg.Any<MediumMessage>(), Arg.Any<ConsumerExecutorDescriptor>(), Arg.Any<CancellationToken>())
+            .Returns(executing.Task);
+        var dispatcher = new Dispatcher(_logger, new TestThreadSafeMessageSender(), options, _executor, _storage);
+        using var cts = new CancellationTokenSource();
+        await dispatcher.StartAsync(cts.Token);
+
+        // One message occupies the single execution slot, one fills the buffer, the third blocks.
+        (await dispatcher.EnqueueToExecute(CreateTestMessage())).Should().BeTrue();
+        await Task.Delay(100);
+        (await dispatcher.EnqueueToExecute(CreateTestMessage())).Should().BeTrue();
+        var blocked = dispatcher.EnqueueToExecute(CreateTestMessage()).AsTask();
+        await Task.Delay(100);
+        blocked.IsCompleted.Should().BeFalse();
+
+        var drain = dispatcher.DrainReceivedAsync(TimeSpan.FromSeconds(5));
+
+        // Released as soon as the drain closes the buffer, not when the executions finish.
+        (await blocked.WaitAsync(TimeSpan.FromSeconds(2))).Should().BeFalse();
+        drain.IsCompleted.Should().BeFalse();
+        executing.SetResult(OperateResult.Success);
+        await drain;
+        await cts.CancelAsync();
+    }
+
+    [Fact]
     public async Task DrainReceivedAsync_ExecutesBufferedMessages_WithinGrace()
     {
         // Arrange
@@ -368,6 +402,50 @@ public class DispatcherTests
         await _storage.Received(1)
             .ChangeReceiveStateToImmediateRetryAsync(Arg.Is<string[]>(ids =>
                 ids.Length == 5 && ids.OrderBy(x => x).SequenceEqual(new[] { "1", "2", "3", "4", "5" })));
+
+        blocker.TrySetResult(OperateResult.Success);
+        await cts.CancelAsync();
+    }
+
+    [Fact]
+    public async Task DrainReceivedAsync_DoesNotFlag_MessagesWhoseLeaseExpired()
+    {
+        var firstCallStarted = new TaskCompletionSource();
+        var blocker = new TaskCompletionSource<OperateResult>();
+        _executor.ExecuteAsync(Arg.Any<MediumMessage>(), Arg.Any<ConsumerExecutorDescriptor>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                firstCallStarted.TrySetResult();
+                return blocker.Task;
+            });
+
+        var options = Options.Create(new CapOptions
+        {
+            EnableSubscriberParallelExecute = true,
+            EnableImmediateRetryOnShutdown = true,
+            SubscriberParallelExecuteThreadCount = 1,
+            SubscriberParallelExecuteBufferFactor = 100
+        });
+        var dispatcher = new Dispatcher(_logger, new TestThreadSafeMessageSender(), options, _executor, _storage);
+        using var cts = new CancellationTokenSource();
+        await dispatcher.StartAsync(cts.Token);
+
+        var inFlightExpired = CreateTestMessage("1");
+        inFlightExpired.LeasedUntil = DateTime.Now.AddSeconds(-1);
+        var bufferedValid = CreateTestMessage("2");
+        bufferedValid.LeasedUntil = DateTime.Now.AddMinutes(1);
+        var bufferedExpired = CreateTestMessage("3");
+        bufferedExpired.LeasedUntil = DateTime.Now.AddSeconds(-1);
+
+        await dispatcher.EnqueueToExecute(inFlightExpired);
+        await firstCallStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await dispatcher.EnqueueToExecute(bufferedValid);
+        await dispatcher.EnqueueToExecute(bufferedExpired);
+
+        await dispatcher.DrainReceivedAsync(TimeSpan.FromMilliseconds(300));
+
+        await _storage.Received(1)
+            .ChangeReceiveStateToImmediateRetryAsync(Arg.Is<string[]>(ids => ids.Length == 1 && ids[0] == "2"));
 
         blocker.TrySetResult(OperateResult.Success);
         await cts.CancelAsync();

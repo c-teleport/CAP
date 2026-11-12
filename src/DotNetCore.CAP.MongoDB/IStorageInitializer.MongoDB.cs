@@ -125,9 +125,10 @@ public class MongoDBStorageInitializer : IStorageInitializer
 
         async Task DropReceivedMessageDeprecatedIndexesAsync()
         {
-            var obsoleteIndexes = new HashSet<string> { 
+            var obsoleteIndexes = new HashSet<string> {
                 "Name", "Added", "ExpiresAt", "StatusName", "Retries", "Version",
-                "Added_1", "ExpiresAt_1", "StatusName_1", "Retries_1", "Version_1" };
+                "Added_1", "ExpiresAt_1", "StatusName_1", "Retries_1", "Version_1",
+                "StatusName_1_Added_1_LeasedUntil_1" };
            
             var col = database.GetCollection<ReceivedMessage>(options.ReceivedCollection);
            

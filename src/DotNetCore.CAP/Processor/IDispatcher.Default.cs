@@ -39,7 +39,7 @@ public class Dispatcher : IDispatcher
     private Task[]? _processingTasks;
 
     // Received messages currently inside a subscriber, so a timed-out drain can flag them too.
-    private readonly ConcurrentDictionary<string, byte> _executing = new();
+    private readonly ConcurrentDictionary<string, MediumMessage> _executing = new();
 
     public Dispatcher(
         ILogger<Dispatcher> logger,
@@ -171,7 +171,8 @@ public class Dispatcher : IDispatcher
             return;
         }
 
-        // Stop accepting new received messages; buffered items keep flowing to the processing loops.
+        // Closing the buffer first also releases consumer callbacks blocked on a full buffer: their
+        // EnqueueToExecute returns false and they return the message to the broker.
         _receivedChannel.Writer.TryComplete();
 
         var buffered = _receivedChannel.Reader.CanCount ? _receivedChannel.Reader.Count : -1;
@@ -216,11 +217,15 @@ public class Dispatcher : IDispatcher
             return;
         }
 
-        var ids = new List<string>(_executing.Keys);
+        var remaining = new List<MediumMessage>(_executing.Values);
         while (_receivedChannel.Reader.TryRead(out var messageData))
         {
-            ids.Add(messageData.Item1.DbId);
+            remaining.Add(messageData.Item1);
         }
+
+        // An expired lease may already belong to another instance; flagging the row would clear that lease.
+        var now = DateTime.Now;
+        var ids = remaining.Where(m => m.LeasedUntil is not { } leasedUntil || leasedUntil > now).Select(m => m.DbId).ToList();
 
         if (ids.Count == 0)
         {
@@ -485,7 +490,7 @@ public class Dispatcher : IDispatcher
     private async Task ProcessReceivedMessageAsync((MediumMessage, ConsumerExecutorDescriptor?) messageData)
     {
         var (message, descriptor) = messageData;
-        _executing[message.DbId] = 0;
+        _executing[message.DbId] = message;
         try
         {
             await _executor.ExecuteAsync(message, descriptor, _tasksCts!.Token).ConfigureAwait(false);

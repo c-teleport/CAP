@@ -108,7 +108,9 @@ public class MongoDBDataStorage : IDataStorage
     public async Task ChangeReceiveStateToImmediateRetryAsync(string[] ids)
     {
         var collection = _database.GetCollection<ReceivedMessage>(_options.Value.ReceivedCollection);
-        var updateDef = Builders<ReceivedMessage>.Update.Set(x => x.StatusName, nameof(StatusName.RetryImmediately));
+        var updateDef = Builders<ReceivedMessage>.Update
+            .Set(x => x.StatusName, nameof(StatusName.RetryImmediately))
+            .Set(x => x.LeasedUntil, null);
         // A message may finish between being flagged and the host dying; never re-run a Succeeded one.
         var filter = Builders<ReceivedMessage>.Filter.In(x => x.Id, ids.Select(long.Parse))
                      & Builders<ReceivedMessage>.Filter.Ne(x => x.StatusName, nameof(StatusName.Succeeded));
@@ -138,7 +140,7 @@ public class MongoDBDataStorage : IDataStorage
         }
     }
 
-    public async Task ChangeReceiveStateAsync(MediumMessage message, StatusName state)
+    public async Task<bool> ChangeReceiveStateAsync(MediumMessage message, StatusName state)
     {
         var collection = _database.GetCollection<ReceivedMessage>(_options.Value.ReceivedCollection);
 
@@ -146,9 +148,60 @@ public class MongoDBDataStorage : IDataStorage
             .Set(x => x.Content, _serializer.Serialize(message.Origin))
             .Set(x => x.Retries, message.Retries)
             .Set(x => x.ExpiresAt, message.ExpiresAt)
-            .Set(x => x.StatusName, state.ToString("G"));
+            .Set(x => x.StatusName, state.ToString("G"))
+            .Set(x => x.LeasedUntil, message.LeasedUntil);
 
-        await collection.UpdateOneAsync(x => x.Id == long.Parse(message.DbId), updateDef).ConfigureAwait(false);
+        var filter = Builders<ReceivedMessage>.Filter.Eq(x => x.Id, long.Parse(message.DbId));
+        // A row this run still owns may have been flagged RetryImmediately on shutdown, which clears its lease.
+        if (message.HeldLease is { } held)
+            filter &= Builders<ReceivedMessage>.Filter.Where(x =>
+                x.LeasedUntil == held || (x.LeasedUntil == null && x.StatusName == nameof(StatusName.RetryImmediately)));
+
+        var result = await collection.UpdateOneAsync(filter, updateDef).ConfigureAwait(false);
+        if (result.MatchedCount != 1) return false;
+
+        message.HeldLease = message.LeasedUntil;
+        return true;
+    }
+
+    public async Task<bool> TryLeaseReceivedMessageAsync(MediumMessage message, TimeSpan lease)
+    {
+        var collection = _database.GetCollection<ReceivedMessage>(_options.Value.ReceivedCollection);
+        var id = long.Parse(message.DbId);
+        var now = DateTime.Now;
+        var expectedStatus = message.StatusName.ToString("G");
+        var expectedRetries = message.Retries;
+        var leasedUntil = now.Add(lease);
+
+        var result = await collection.UpdateOneAsync(
+            x => x.Id == id && x.StatusName == expectedStatus && x.Retries == expectedRetries && (x.LeasedUntil == null || x.LeasedUntil < now),
+            Builders<ReceivedMessage>.Update
+                .Set(x => x.StatusName, nameof(StatusName.Scheduled))
+                .Set(x => x.LeasedUntil, leasedUntil)).ConfigureAwait(false);
+        if (result.ModifiedCount != 1) return false;
+
+        message.StatusName = StatusName.Scheduled;
+        message.LeasedUntil = leasedUntil;
+        message.HeldLease = leasedUntil;
+        return true;
+    }
+
+    public async Task<bool> TryRenewReceivedMessageLeaseAsync(MediumMessage message, TimeSpan lease)
+    {
+        if (message.LeasedUntil is not { } current) return false;
+
+        var collection = _database.GetCollection<ReceivedMessage>(_options.Value.ReceivedCollection);
+        var id = long.Parse(message.DbId);
+        var leasedUntil = DateTime.Now.Add(lease);
+
+        var result = await collection.UpdateOneAsync(
+            x => x.Id == id && x.LeasedUntil == current,
+            Builders<ReceivedMessage>.Update.Set(x => x.LeasedUntil, leasedUntil)).ConfigureAwait(false);
+        if (result.MatchedCount != 1) return false;
+
+        message.LeasedUntil = leasedUntil;
+        message.HeldLease = leasedUntil;
+        return true;
     }
 
     public async Task<MediumMessage> StoreMessageAsync(string name, Message content, object? dbTransaction = null)
@@ -220,8 +273,11 @@ public class MongoDBDataStorage : IDataStorage
             Origin = message,
             Added = DateTime.Now,
             ExpiresAt = null,
-            Retries = 0
+            Retries = 0,
+            StatusName = StatusName.Scheduled
         };
+        mdMessage.LeasedUntil = mdMessage.Added.AddSeconds(_capOptions.Value.ReceivedMessageLeaseSeconds);
+        mdMessage.HeldLease = mdMessage.LeasedUntil;
         var content = _serializer.Serialize(mdMessage.Origin);
 
         var collection = _database.GetCollection<ReceivedMessage>(_options.Value.ReceivedCollection);
@@ -236,7 +292,8 @@ public class MongoDBDataStorage : IDataStorage
             ExpiresAt = mdMessage.ExpiresAt,
             Retries = mdMessage.Retries,
             Version = _capOptions.Value.Version,
-            StatusName = nameof(StatusName.Scheduled)
+            StatusName = nameof(StatusName.Scheduled),
+            LeasedUntil = mdMessage.LeasedUntil
         };
 
         await collection.InsertOneAsync(store).ConfigureAwait(false);
@@ -292,14 +349,23 @@ public class MongoDBDataStorage : IDataStorage
 
     public async Task<IEnumerable<MediumMessage>> GetReceivedMessagesOfNeedRetry(TimeSpan lookbackSeconds)
     {
-        var fourMinAgo = DateTime.Now.Subtract(lookbackSeconds);
+        var now = DateTime.Now;
+        var fourMinAgo = now.Subtract(lookbackSeconds);
         var collection = _database.GetCollection<ReceivedMessage>(_options.Value.ReceivedCollection);
+        // An expired lease implies Added < now - lease. addedBound repeats the later of the two bounds outside the OR,
+        // where the planner can use it to skip rows that were only just stored.
+        var leaseBound = now.AddSeconds(-_capOptions.Value.ReceivedMessageLeaseSeconds);
+        var addedBound = leaseBound > fourMinAgo ? leaseBound : fourMinAgo;
+        // The top-level status list is redundant; it lets the planner merge-sort on Added instead of sorting in memory.
+        var unfinished = Builders<ReceivedMessage>.Filter.In(x => x.StatusName,
+            new[] { nameof(StatusName.Failed), nameof(StatusName.Scheduled), nameof(StatusName.RetryImmediately) });
+        var eligible = Builders<ReceivedMessage>.Filter.Where(x => x.Retries < _capOptions.Value.FailedRetryCount
+                       && (((x.StatusName == nameof(StatusName.Failed) || x.StatusName == nameof(StatusName.Scheduled))
+                            && x.Added < addedBound
+                            && ((x.LeasedUntil == null && x.Added < fourMinAgo) || (x.LeasedUntil < now && x.Added < leaseBound)))
+                           || x.StatusName == nameof(StatusName.RetryImmediately)));
         var queryResult = await collection
-            .Find(x => x.Retries < _capOptions.Value.FailedRetryCount
-                       && ((x.Added < fourMinAgo
-                            && (x.StatusName == nameof(StatusName.Failed) ||
-                                x.StatusName == nameof(StatusName.Scheduled)))
-                           || x.StatusName == nameof(StatusName.RetryImmediately)))
+            .Find(unfinished & eligible)
             .SortBy(x => x.Added)
             .Limit(200)
             .ToListAsync().ConfigureAwait(false);
@@ -308,7 +374,9 @@ public class MongoDBDataStorage : IDataStorage
             DbId = x.Id.ToString(),
             Origin = _serializer.Deserialize(x.Content)!,
             Retries = x.Retries,
-            Added = x.Added
+            Added = x.Added,
+            StatusName = Enum.Parse<StatusName>(x.StatusName),
+            LeasedUntil = x.LeasedUntil
         }).ToList();
     }
 

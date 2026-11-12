@@ -17,6 +17,7 @@ namespace DotNetCore.CAP.Processor;
 public class MessageNeedToRetryProcessor : IProcessor
 {
     private const int MinSuggestedValueForFallbackWindowLookbackSeconds = 30;
+    private const int MinSuggestedValueForReceivedMessageLeaseSeconds = 10;
     private readonly ILogger<MessageNeedToRetryProcessor> _logger;
     private readonly IDispatcher _dispatcher;
     private readonly TimeSpan _waitingInterval;
@@ -24,6 +25,7 @@ public class MessageNeedToRetryProcessor : IProcessor
     private readonly IDataStorage _dataStorage;
     private readonly TimeSpan _ttl;
     private readonly TimeSpan _lookbackSeconds;
+    private readonly TimeSpan _lease;
     private readonly string _instance;
     private Task? _failedRetryConsumeTask;
 
@@ -35,6 +37,7 @@ public class MessageNeedToRetryProcessor : IProcessor
         _dispatcher = dispatcher;
         _waitingInterval = TimeSpan.FromSeconds(options.Value.FailedRetryInterval);
         _lookbackSeconds = TimeSpan.FromSeconds(options.Value.FallbackWindowLookbackSeconds);
+        _lease = TimeSpan.FromSeconds(options.Value.ReceivedMessageLeaseSeconds);
         _dataStorage = dataStorage;
         _ttl = _waitingInterval.Add(TimeSpan.FromSeconds(10));
 
@@ -51,9 +54,12 @@ public class MessageNeedToRetryProcessor : IProcessor
 
         _ = Task.Run(() => ProcessPublishedAsync(storage, context));
 
-        if (_options.Value.UseStorageLock && _failedRetryConsumeTask is { IsCompleted: false })
+        // A poll still dispatching the previous batch is not joined by a second one: with leases each poll would take
+        // its own rows, and retry loops would pile up for as long as a downstream dependency keeps failing.
+        if (_failedRetryConsumeTask is { IsCompleted: false })
         {
-            await _dataStorage.RenewLockAsync($"received_retry_{_options.Value.Version}", _ttl, _instance, context.CancellationToken);
+            if (_options.Value.UseStorageLock)
+                await _dataStorage.RenewLockAsync($"received_retry_{_options.Value.Version}", _ttl, _instance, context.CancellationToken);
 
             await context.WaitAsync(_waitingInterval).ConfigureAwait(false);
 
@@ -100,7 +106,13 @@ public class MessageNeedToRetryProcessor : IProcessor
         {
             context.ThrowIfStopping();
 
-            await _dispatcher.EnqueueToExecute(message).ConfigureAwait(false);
+            if (!await connection.TryLeaseReceivedMessageAsync(message, _lease).ConfigureAwait(false))
+                continue;
+
+            // Rejected only while shutting down; hand the message straight to the next instance instead of
+            // leaving it to sit out the lease it was just given.
+            if (!await _dispatcher.EnqueueToExecute(message).ConfigureAwait(false))
+                await connection.ChangeReceiveStateToImmediateRetryAsync(new[] { message.DbId }).ConfigureAwait(false);
         }
 
         if (_options.Value.UseStorageLock)
@@ -126,6 +138,11 @@ public class MessageNeedToRetryProcessor : IProcessor
         if (_lookbackSeconds < TimeSpan.FromSeconds(MinSuggestedValueForFallbackWindowLookbackSeconds))
         {
             _logger.LogWarning("The provided FallbackWindowLookbackSeconds of {currentSetFallbackWindowLookbackSeconds} is set to a value lower than {minSuggestedSeconds} seconds. This might cause unwanted unsafe behavior if the consumer takes more than the provided FallbackWindowLookbackSeconds to execute. ", _options.Value.FallbackWindowLookbackSeconds, MinSuggestedValueForFallbackWindowLookbackSeconds);
+        }
+
+        if (_lease < TimeSpan.FromSeconds(MinSuggestedValueForReceivedMessageLeaseSeconds))
+        {
+            _logger.LogWarning("The provided ReceivedMessageLeaseSeconds of {currentSetReceivedMessageLeaseSeconds} is lower than {minSuggestedSeconds} seconds. A slow storage round-trip may then lose the lease and let another instance run the same message.", _options.Value.ReceivedMessageLeaseSeconds, MinSuggestedValueForReceivedMessageLeaseSeconds);
         }
     }
 }
