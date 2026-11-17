@@ -155,17 +155,23 @@ internal class Bootstrapper : BackgroundService, IBootstrapper
             if (consumerRegister != null)
             {
                 await consumerRegister.StopReceivingAsync().ConfigureAwait(false);
-
-                // 2) Wait for in-flight received-message callbacks. In synchronous mode this is where the
-                //    subscriber execution completes.
-                await consumerRegister.WaitForInflightMessagesAsync(Remaining(deadline)).ConfigureAwait(false);
             }
 
-            // 3) Drain messages buffered for parallel execution (no-op in synchronous mode).
+            // 2) Drain the parallel-execution buffer (no-op in synchronous mode). This runs before the callback
+            //    wait on purpose: under load the callbacks are blocked on a full buffer, and waiting on them
+            //    first would spend the budget getting them in line instead of on the executions already running.
+            //    Closing the buffer makes them return their message to the broker at once.
             var dispatcher = _serviceProvider.GetService<IDispatcher>();
             if (dispatcher != null)
             {
                 await dispatcher.DrainReceivedAsync(Remaining(deadline)).ConfigureAwait(false);
+            }
+
+            // 3) Wait for in-flight received-message callbacks: inline executions (synchronous mode, and
+            //    retried messages in parallel mode) complete here.
+            if (consumerRegister != null)
+            {
+                await consumerRegister.WaitForInflightMessagesAsync(Remaining(deadline)).ConfigureAwait(false);
             }
         }
         catch (Exception ex)
