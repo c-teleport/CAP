@@ -34,3 +34,4 @@ Properties
 .vscode/*
 site/
 *.lock
+artifacts-local/

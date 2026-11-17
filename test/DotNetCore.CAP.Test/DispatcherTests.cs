@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
@@ -294,6 +294,40 @@ public class DispatcherTests
 
         // Assert
         accepted.Should().BeFalse();
+        await cts.CancelAsync();
+    }
+
+    [Fact]
+    public async Task DrainReceivedAsync_ReleasesCallbackBlockedOnFullBuffer_WithRejection()
+    {
+        var options = Options.Create(new CapOptions
+        {
+            EnableSubscriberParallelExecute = true,
+            SubscriberParallelExecuteThreadCount = 1,
+            SubscriberParallelExecuteBufferFactor = 1
+        });
+        var executing = new TaskCompletionSource<OperateResult>();
+        _executor.ExecuteAsync(Arg.Any<MediumMessage>(), Arg.Any<ConsumerExecutorDescriptor>(), Arg.Any<CancellationToken>())
+            .Returns(executing.Task);
+        var dispatcher = new Dispatcher(_logger, new TestThreadSafeMessageSender(), options, _executor, _storage);
+        using var cts = new CancellationTokenSource();
+        await dispatcher.StartAsync(cts.Token);
+
+        // One message occupies the single execution slot, one fills the buffer, the third blocks.
+        (await dispatcher.EnqueueToExecute(CreateTestMessage())).Should().BeTrue();
+        await Task.Delay(100);
+        (await dispatcher.EnqueueToExecute(CreateTestMessage())).Should().BeTrue();
+        var blocked = dispatcher.EnqueueToExecute(CreateTestMessage()).AsTask();
+        await Task.Delay(100);
+        blocked.IsCompleted.Should().BeFalse();
+
+        var drain = dispatcher.DrainReceivedAsync(TimeSpan.FromSeconds(5));
+
+        // Released as soon as the drain closes the buffer, not when the executions finish.
+        (await blocked.WaitAsync(TimeSpan.FromSeconds(2))).Should().BeFalse();
+        drain.IsCompleted.Should().BeFalse();
+        executing.SetResult(OperateResult.Success);
+        await drain;
         await cts.CancelAsync();
     }
 
