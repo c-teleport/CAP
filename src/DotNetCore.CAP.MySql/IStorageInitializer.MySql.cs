@@ -61,9 +61,46 @@ public class MySqlStorageInitializer : IStorageInitializer
                 new MySqlParameter("@LastLockTime", DateTime.MinValue)
             };
             await connection.ExecuteNonQueryAsync(sql, sqlParams: sqlParams).ConfigureAwait(false);
+            await MigrateReceivedTableAsync(connection).ConfigureAwait(false);
         }
 
         _logger.LogDebug("Ensuring all create database tables script are applied.");
+    }
+
+    // MySQL has no ADD COLUMN / CREATE INDEX IF NOT EXISTS, so tables created by an older version are migrated here.
+    // Instances starting together can both pass a guard; the loser's duplicate-column/key error is swallowed.
+    private async Task MigrateReceivedTableAsync(MySqlConnection connection)
+    {
+        var table = new MySqlParameter("@Table", GetReceivedTableName());
+
+        var hasColumn = await connection.ExecuteScalarAsync<long>(
+            "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=@Table AND COLUMN_NAME='LeasedUntil';",
+            table).ConfigureAwait(false);
+        if (hasColumn == 0)
+            await ExecuteIgnoringAsync(connection, $"ALTER TABLE `{GetReceivedTableName()}` ADD COLUMN `LeasedUntil` datetime DEFAULT NULL;", MySqlErrorCode.DuplicateFieldName).ConfigureAwait(false);
+
+        var hasNewIndex = await connection.ExecuteScalarAsync<long>(
+            "SELECT COUNT(DISTINCT INDEX_NAME) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=@Table AND INDEX_NAME='IX_Version_StatusName_Added_LeasedUntil';",
+            table).ConfigureAwait(false);
+        if (hasNewIndex == 0)
+            await ExecuteIgnoringAsync(connection, $"CREATE INDEX `IX_Version_StatusName_Added_LeasedUntil` ON `{GetReceivedTableName()}` (`Version`, `StatusName`, `Added`, `LeasedUntil`);", MySqlErrorCode.DuplicateKeyName).ConfigureAwait(false);
+
+        var hasOldIndex = await connection.ExecuteScalarAsync<long>(
+            "SELECT COUNT(DISTINCT INDEX_NAME) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=@Table AND INDEX_NAME='IX_Version_ExpiresAt_StatusName';",
+            table).ConfigureAwait(false);
+        if (hasOldIndex > 0)
+            await ExecuteIgnoringAsync(connection, $"DROP INDEX `IX_Version_ExpiresAt_StatusName` ON `{GetReceivedTableName()}`;", MySqlErrorCode.CannotDropFieldOrKey).ConfigureAwait(false);
+    }
+
+    private static async Task ExecuteIgnoringAsync(MySqlConnection connection, string sql, MySqlErrorCode ignored)
+    {
+        try
+        {
+            await connection.ExecuteNonQueryAsync(sql).ConfigureAwait(false);
+        }
+        catch (MySqlException ex) when (ex.ErrorCode == ignored)
+        {
+        }
     }
 
     public virtual bool IsSupportSkipLocked()
@@ -97,8 +134,9 @@ CREATE TABLE IF NOT EXISTS `{GetReceivedTableName()}` (
   `Added` datetime NOT NULL,
   `ExpiresAt` datetime DEFAULT NULL,
   `StatusName` varchar(50) NOT NULL,
+  `LeasedUntil` datetime DEFAULT NULL,
   PRIMARY KEY (`Id`),
-  INDEX `IX_Version_ExpiresAt_StatusName` (`Version`, `ExpiresAt`, `StatusName`),
+  INDEX `IX_Version_StatusName_Added_LeasedUntil` (`Version`, `StatusName`, `Added`, `LeasedUntil`),
   INDEX `IX_ExpiresAt_StatusName` (`ExpiresAt`, `StatusName`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 

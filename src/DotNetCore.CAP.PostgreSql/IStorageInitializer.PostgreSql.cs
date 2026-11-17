@@ -77,8 +77,19 @@ CREATE TABLE IF NOT EXISTS {GetReceivedTableName()}(
 );
 
 
+-- Instances starting together can both pass the guards; the loser's DDL error is swallowed instead of failing startup.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = '{schema}' AND table_name = 'received' AND column_name = 'LeasedUntil') THEN
+        BEGIN
+            ALTER TABLE {GetReceivedTableName()} ADD COLUMN ""LeasedUntil"" TIMESTAMP NULL;
+        EXCEPTION WHEN duplicate_column THEN NULL;
+        END;
+    END IF;
+END $$;
 CREATE INDEX IF NOT EXISTS ""idx_received_StatusName_ExpiresAt"" ON {GetReceivedTableName()} (""StatusName"",""ExpiresAt"");
 CREATE INDEX IF NOT EXISTS ""idx_received_StatusName_Added"" ON {GetReceivedTableName()} (""StatusName"",""Added"");
+DROP INDEX IF EXISTS ""{schema}"".""idx_received_StatusName_Added_LeasedUntil"";
 DROP INDEX IF EXISTS ""idx_received_ExpiresAt_StatusName"";
 DROP INDEX IF EXISTS ""idx_received_Version_ExpiresAt_StatusName"";
 

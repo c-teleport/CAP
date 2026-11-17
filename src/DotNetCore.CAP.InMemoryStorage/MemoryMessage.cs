@@ -10,7 +10,5 @@ internal class MemoryMessage : MediumMessage
 {
     public string Name { get; set; } = default!;
 
-    public StatusName StatusName { get; set; }
-
     public string Group { get; set; } = default!;
 }

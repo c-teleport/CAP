@@ -35,6 +35,7 @@ public class CapOptions
         DefaultGroupName = "cap.queue." + Assembly.GetEntryAssembly()?.GetName().Name!.ToLower();
         CollectorCleaningInterval = 300;
         FallbackWindowLookbackSeconds = 240;
+        ReceivedMessageLeaseSeconds = 60;
         SchedulerBatchSize = 1000;
         GracefulShutdownTimeout = TimeSpan.FromSeconds(20);
         EnableImmediateRetryOnShutdown = true;
@@ -139,9 +140,22 @@ public class CapOptions
     /// <summary>
     /// Gets or sets the lookback time window (in seconds) for the retry processor to pick up scheduled or failed status messages.
     /// This ensures that messages with clocks slightly out of sync are still processed correctly.
+    /// Received messages written by this version carry a lease instead (see <see cref="ReceivedMessageLeaseSeconds"/>);
+    /// the window only applies to published messages and to received rows stored by an older version.
     /// Default is 240 seconds (4 minutes).
     /// </summary>
     public int FallbackWindowLookbackSeconds { get; set; }
+
+    /// <summary>
+    /// Gets or sets the lease (in seconds) an instance holds on a received message while it is buffered or executing.
+    /// While the lease is valid no retry poll on any instance dispatches the message again; once it expires an
+    /// unfinished run is treated as lost and the message is retried. The lease is taken when the message is stored or
+    /// re-dispatched for retry, renewed every third of its length while a subscriber is running, and ends with the
+    /// final Succeeded or Failed write. Time spent waiting in the parallel-execution buffer is not renewed: a message
+    /// that outwaits its lease there is not executed by this instance and is retried instead, so keep the lease longer
+    /// than the expected queueing time. Default is 60 seconds.
+    /// </summary>
+    public int ReceivedMessageLeaseSeconds { get; set; }
 
     /// <summary>
     /// Gets or sets the interval (in seconds) at which the cleanup processor removes expired messages from the message storage.
@@ -168,8 +182,8 @@ public class CapOptions
     /// <summary>
     /// Gets or sets a value indicating whether received messages (buffered or still inside a subscriber) that
     /// cannot finish within <see cref="GracefulShutdownTimeout"/> are moved to the <c>RetryImmediately</c> status so they are
-    /// re-executed on the next retry poll instead of waiting for the <see cref="FallbackWindowLookbackSeconds"/>
-    /// window. Safe because the shutting-down instance is the sole owner of those messages.
+    /// re-executed on the next retry poll instead of waiting out their <see cref="ReceivedMessageLeaseSeconds"/>
+    /// lease. Safe because the shutting-down instance is the sole owner of those messages.
     /// Default is true.
     /// </summary>
     public bool EnableImmediateRetryOnShutdown { get; set; }
