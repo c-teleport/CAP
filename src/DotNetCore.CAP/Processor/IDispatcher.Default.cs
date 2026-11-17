@@ -171,7 +171,8 @@ public class Dispatcher : IDispatcher
             return;
         }
 
-        // Stop accepting new received messages; buffered items keep flowing to the processing loops.
+        // Closing the buffer first also releases consumer callbacks blocked on a full buffer: their
+        // EnqueueToExecute returns false and they return the message to the broker.
         _receivedChannel.Writer.TryComplete();
 
         var buffered = _receivedChannel.Reader.CanCount ? _receivedChannel.Reader.Count : -1;
